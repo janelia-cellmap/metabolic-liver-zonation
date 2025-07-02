@@ -1,10 +1,11 @@
 # %%
 # load your local config (config.yaml)
 import yaml
+
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-data_dir   = cfg["DATA_DIR"]
+data_dir = cfg["DATA_DIR"]
 analysis_dir = cfg["ANALYSIS_DIR"]
 skeleton_dir = cfg["SKELETON_DIR"]
 
@@ -15,10 +16,8 @@ for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
         f"{analysis_dir}/{dataset}/cell_assignments/mito.csv"
     )
 
-
     skeleton_information_df = pd.read_csv(
         f"{skeleton_dir}/{dataset}/mito/metrics/skeleton_metrics.csv"
-        #f"/nrs/cellmap/ackermand/to_delete/failed_skel-2/metrics/skeleton_metrics.csv"
     )
     assert len(skeleton_information_df) == len(general_mito_information_df)
     # combine general information dataframe with skeleton dataframe columns based on ids
