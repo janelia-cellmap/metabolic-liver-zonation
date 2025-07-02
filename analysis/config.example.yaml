@@ -1,0 +1,3 @@
+DATA_DIR: "/path/to/your/data/"
+ANAALYSIS_DIR: "/path/to/your/analysis/"
+SKELETON_DIR: "/path/to/your/skeletons/"
