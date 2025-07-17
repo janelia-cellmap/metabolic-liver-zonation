@@ -262,7 +262,7 @@ mesh_dir  = (
     f"/nrs/cellmap/ackermand/new_meshes/meshes/single_resolution/"
     f"{dataset}/mito/meshes"
 )
-grid_size = 50   # 20×20 grid
+grid_size = 20   # 20×20 grid
 thumb_px   = 512 # thumbnail resolution
 max_frac   = 1.0 # largest thumbnail fills its 1×1 cell
 
@@ -273,6 +273,8 @@ max_frac   = 1.0 # largest thumbnail fills its 1×1 cell
 def mesh_to_thumbnail(ply_path, size=thumb_px):
     mesh = trimesh.load(ply_path, force="mesh")
     verts = mesh.vertices
+
+    # 1) PCA align to X-axis …
     centered = verts - verts.mean(axis=0)
     cov = np.cov(centered.T)
     evals, evecs = np.linalg.eigh(cov)
@@ -283,33 +285,53 @@ def mesh_to_thumbnail(ply_path, size=thumb_px):
         T = np.eye(4)
     else:
         axis /= np.linalg.norm(axis)
-        angle = np.arccos(
-            np.dot(v, target) / (np.linalg.norm(v) * np.linalg.norm(target))
-        )
+        angle = np.arccos(np.dot(v, target) /
+                          (np.linalg.norm(v) * np.linalg.norm(target)))
         centroid = verts.mean(axis=0)
         T = trimesh.transformations.rotation_matrix(angle, axis, centroid)
     mesh_aligned = mesh.copy()
     mesh_aligned.apply_transform(T)
 
+    # 2) project to 2D
     verts2d = mesh_aligned.vertices[:, :2]
-    tris2d = verts2d[mesh_aligned.faces]
+    tris2d  = verts2d[mesh_aligned.faces]
     x_extent = np.ptp(verts2d[:, 0])
 
+    # 3) shading
+    normals = mesh_aligned.face_normals  # (F,3)
+    light_dir = np.array([1.0, 1.0, 2.0])
+    light_dir /= np.linalg.norm(light_dir)
+    intensity = np.clip(normals.dot(light_dir), 0, 1)
+    amb, diff = 0.3, 0.7
+    shades = amb + diff * intensity
+    facecolors = np.stack([shades]*3 + [np.ones_like(shades)], axis=1)
+
+    # ——— back-face culling ———
+    # assume camera looks along +Z onto XY
+    view_dir = np.array([0.0, 0.0, 1.0])
+    facing = normals.dot(view_dir) > 0
+    tris2d    = tris2d[facing]
+    facecolors = facecolors[facing]
+
+    # 4) render
     fig = Figure(figsize=(size/100, size/100), dpi=100)
     canvas = FigureCanvas(fig)
     ax = fig.add_subplot(111)
-    ax.add_collection(
-        PolyCollection(tris2d,
-                       facecolor="lightgrey",
-                       edgecolor="black",
-                       linewidths=0.1)
-    )
+
+    ax.add_collection(PolyCollection(
+        tris2d,
+        facecolors=facecolors,
+        edgecolor='none',
+        antialiased=True
+    ))
+
     ax.set_xlim(verts2d[:, 0].min(), verts2d[:, 0].max())
     ax.set_ylim(verts2d[:, 1].min(), verts2d[:, 1].max())
-    ax.axis("off")
-    ax.set_aspect("equal", adjustable="box")
+    ax.axis('off')
+    ax.set_aspect('equal', adjustable='box')
     fig.tight_layout(pad=0)
     canvas.draw()
+
     buf = np.frombuffer(canvas.tostring_argb(), dtype=np.uint8)
     buf.shape = (size, size, 4)
     buf = buf[:, :, [1,2,3,0]]
@@ -405,7 +427,6 @@ ax.text(-0.3, grid_size/2,
 ax.set_title("Mesh Grid — thumbnails on an evenly spaced grid")
 plt.tight_layout()
 plt.show()
-
 
 
 # %%
