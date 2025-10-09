@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal, Dict
 import numpy as np
-
+from vis import plot_cloud_and_axes_plotly
 
 @dataclass(frozen=True)
 class NematicResult:
@@ -228,281 +228,39 @@ def extract_axes_sigmas(result: NematicResult) -> Dict[str, np.ndarray]:
         "sigma3": sigma3,
     }
 
-# %%
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
-def plot_cloud_and_vectors(
-    X: np.ndarray,
-    cap_mask: np.ndarray,
-    vectors: list,
-    c: np.ndarray = None,
-    color_all: str = "tab:blue",
-    color_cap: str = "tab:orange",
-    vector_colors: list = None,
-    s_all: int = 8,
-    s_cap: int = 12,
-    sphere_wireframe: bool = True,
-):
+def calculate_and_extract_nematic_results(
+    X_contacts: np.ndarray,
+    center: np.ndarray,
+    *, eps: float = 0.0
+) -> Dict[str, np.ndarray]:
     """
-    Interactive 3D scatter plot of points on a sphere and one or more vectors.
+    Convenience: compute nematic from contact voxels and extract axes and sigmas.
 
     Parameters
     ----------
-    X : (N,3) array
-        Point cloud on the sphere.
-    cap_mask : (N,) bool array
-        Mask selecting a spherical cap subset of X.
-    vectors : list of (3,) arrays
-        Direction vectors to plot from center c.
-    c : (3,) array, optional
-        Center of sphere (default origin).
-    color_all, color_cap : str
-        Colors for all points and cap points.
-    vector_colors : list of str
-        Colors for each vector; defaults to distinct matplotlib tab colors.
-    s_all, s_cap : int
-        Scatter point sizes.
-    sphere_wireframe : bool
-        If True, draw a light wireframe unit sphere for context.
+    X_contacts : (M,3) float array
+        Contact-site voxel coordinates on the cell surface (apical, basal, ...).
+        Use one-voxel-thick boundary samples to avoid multi-counting.
+    center : (3,) float array
+        Geometric center (unweighted average of all cell voxels).
+    eps : float, optional
+        Discard voxels with ||x_i - c|| <= eps to avoid numerical issues.
+
+    Returns
+    -------
+    dict with keys:
+        'N' : (3,3) nematic tensor
+        'a1', 'a2', 'a3' : (3,) eigenvectors (axes)
+        'sigma1', 'sigma2', 'sigma3' : eigenvalues
+        'n_valid' : int, number of valid contact voxels used
     """
-
-    if c is None:
-        c = np.zeros(3)
-    if vector_colors is None:
-        vector_colors = ["tab:red", "tab:green", "tab:purple"]
-
-    X_cap = X[cap_mask]
-
-    fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_box_aspect([1, 1, 1])
-
-    # Plot all points
-    ax.scatter(X[:, 0], X[:, 1], X[:, 2],
-               s=s_all, alpha=0.35, label="X (all)", c=color_all)
-
-    # Plot cap points
-    ax.scatter(X_cap[:, 0], X_cap[:, 1], X_cap[:, 2],
-               s=s_cap, alpha=0.9, label="X_cap (cap)", c=color_cap)
-
-    # Optional wireframe sphere
-    if sphere_wireframe:
-        u = np.linspace(0, 2 * np.pi, 40)
-        v = np.linspace(0, np.pi, 20)
-        xs = np.outer(np.cos(u), np.sin(v))
-        ys = np.outer(np.sin(u), np.sin(v))
-        zs = np.outer(np.ones_like(u), np.cos(v))
-        ax.plot_wireframe(xs, ys, zs, rstride=4, cstride=4,
-                          linewidth=0.4, alpha=0.25, color="gray")
-
-    # Plot vectors from center
-    for i, v in enumerate(vectors):
-        v = np.asarray(v, dtype=float).reshape(3)
-        color = vector_colors[i % len(vector_colors)]
-        ax.quiver(c[0], c[1], c[2],
-                  v[0], v[1], v[2],
-                  length=1.0, arrow_length_ratio=0.12,
-                  linewidth=2.0, color=color, label=f"v{i+1} (+)")
-        # optional mirrored arrow
-        ax.quiver(c[0], c[1], c[2],
-                  -v[0], -v[1], -v[2],
-                  length=1.0, arrow_length_ratio=0.12,
-                  linewidth=1.5, color=color, alpha=0.6, label=f"v{i+1} (-)")
-
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.set_title("3D point cloud with spherical cap and vectors")
-
-    # Equal scaling
-    def set_equal_3d(ax):
-        x_limits = ax.get_xlim3d()
-        y_limits = ax.get_ylim3d()
-        z_limits = ax.get_zlim3d()
-        x_range = abs(x_limits[1] - x_limits[0])
-        y_range = abs(y_limits[1] - y_limits[0])
-        z_range = abs(z_limits[1] - z_limits[0])
-        x_middle = np.mean(x_limits)
-        y_middle = np.mean(y_limits)
-        z_middle = np.mean(z_limits)
-        radius = 0.6 * max([x_range, y_range, z_range])
-        ax.set_xlim3d([x_middle - radius, x_middle + radius])
-        ax.set_ylim3d([y_middle - radius, y_middle + radius])
-        ax.set_zlim3d([z_middle - radius, z_middle + radius])
-
-    set_equal_3d(ax)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
-    plt.tight_layout()
-    plt.show()
-
-import numpy as np
-import plotly.graph_objects as go
-
-import numpy as np
-import plotly.graph_objects as go
-
-import numpy as np
-import plotly.graph_objects as go
-
-def plot_cloud_and_axes_plotly(
-    X: np.ndarray,
-    cap_mask: np.ndarray,
-    a1: np.ndarray,
-    a2: np.ndarray,
-    sigma1: float,
-    sigma2: float,
-    c: np.ndarray = None,
-    radius: float = 0.03,
-    color_all: str = "rgba(31,119,180,0.35)",
-    color_cap: str = "rgba(255,127,14,0.95)",
-    color_a1: str = "red",
-    color_a2: str = "green",
-    point_size_all: float = 2.0,
-    point_size_cap: float = 3.0,
-    show_sphere: bool = True,
-    sphere_opacity: float = 0.12,
-    n_theta: int = 48,
-    n_s: int = 16,
-):
-    """
-    Plots:
-      - all points X (one color),
-      - cap points X_cap (another color),
-      - a1 and a2 as CYLINDERS centered at c and extending equally
-        in +/- directions with half-length = sigma (total length = 2*sigma).
-
-    Cylinder parameterization (simplest & robust):
-      P(θ, s) = c + s*u + r*(cosθ*b1 + sinθ*b2),
-      where u = a/||a||, b1,b2 form an orthonormal basis perpendicular to u,
-      θ in [0, 2π), s in [-sigma, +sigma].
-    """
-
-    def _normalize(v):
-        v = np.asarray(v, float).reshape(3)
-        n = np.linalg.norm(v)
-        return v / (n + 1e-12)
-
-    def _frame_from_dir(vhat):
-        """Return orthonormal (u, b1, b2) given unit vhat as u."""
-        u = _normalize(vhat)
-        # pick a temp vector not parallel to u
-        tmp = np.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        b1 = np.cross(u, tmp)
-        b1 = b1 / (np.linalg.norm(b1) + 1e-12)
-        b2 = np.cross(u, b1)
-        return u, b1, b2
-
-    def _cylinder_pm(c0, a, sigma, r, n_theta=48, n_s=16):
-        """
-        Cylinder centered at c0, axis along 'a' (unit direction used),
-        extending from s=-sigma to s=+sigma.
-        Returns (X, Y, Z) meshes for go.Surface.
-        """
-        c0 = np.asarray(c0, float).reshape(3)
-        u, b1, b2 = _frame_from_dir(a)
-
-        theta = np.linspace(0, 2*np.pi, n_theta)
-        s = np.linspace(-sigma, +sigma, n_s)
-        Theta, S = np.meshgrid(theta, s)  # (n_s, n_theta)
-
-        # P(θ, s) = c + s*u + r*(cosθ*b1 + sinθ*b2)
-        cosT, sinT = np.cos(Theta), np.sin(Theta)
-        X = c0[0] + S * u[0] + r * (cosT * b1[0] + sinT * b2[0])
-        Y = c0[1] + S * u[1] + r * (cosT * b1[1] + sinT * b2[1])
-        Z = c0[2] + S * u[2] + r * (cosT * b1[2] + sinT * b2[2])
-        return X, Y, Z
-
-    # defaults / data prep
-    if c is None:
-        c = np.zeros(3, dtype=float)
-    X = np.asarray(X, float)
-    X_cap = X[cap_mask]
-
-    # unit directions (display length comes only from sigmas)
-    a1_u = _normalize(a1)
-    a2_u = _normalize(a2)
-
-    # build traces
-    traces = []
-
-    # All points
-    traces.append(go.Scatter3d(
-        x=X[:, 0], y=X[:, 1], z=X[:, 2],
-        mode="markers",
-        marker=dict(size=point_size_all, color=color_all),
-        name="X (all)"
-    ))
-
-    # Cap points
-    traces.append(go.Scatter3d(
-        x=X_cap[:, 0], y=X_cap[:, 1], z=X_cap[:, 2],
-        mode="markers",
-        marker=dict(size=point_size_cap, color=color_cap),
-        name="X_cap"
-    ))
-
-    # Optional unit sphere for context
-    if show_sphere:
-        u = np.linspace(0, 2*np.pi, 80)
-        v = np.linspace(0, np.pi, 40)
-        uu, vv = np.meshgrid(u, v)
-        xs = np.cos(uu) * np.sin(vv)
-        ys = np.sin(uu) * np.sin(vv)
-        zs = np.cos(vv)
-        traces.append(go.Surface(
-            x=xs, y=ys, z=zs,
-            showscale=False,
-            opacity=sphere_opacity,
-            colorscale=[[0, "lightgray"], [1, "lightgray"]],
-            hoverinfo="skip",
-            name="unit sphere"
-        ))
-
-    # Cylinders for a1 (half-length sigma1) and a2 (half-length sigma2)
-    X1, Y1, Z1 = _cylinder_pm(c, a1_u, sigma1, radius, n_theta=n_theta, n_s=n_s)
-    X2, Y2, Z2 = _cylinder_pm(c, a2_u, sigma2, radius, n_theta=n_theta, n_s=n_s)
-
-    traces.append(go.Surface(
-        x=X1, y=Y1, z=Z1, showscale=False, opacity=0.98,
-        colorscale=[[0, color_a1], [1, color_a1]],
-        name=f"a1 (total len={2*sigma1:.3f})"
-    ))
-    traces.append(go.Surface(
-        x=X2, y=Y2, z=Z2, showscale=False, opacity=0.98,
-        colorscale=[[0, color_a2], [1, color_a2]],
-        name=f"a2 (total len={2*sigma2:.3f})"
-    ))
-
-    # Optional thin axis lines to emphasize exact endpoints
-    def _axis_line(c0, uhat, sigma, color, name):
-        p0 = c0 - uhat * sigma
-        p1 = c0 + uhat * sigma
-        return go.Scatter3d(
-            x=[p0[0], p1[0]], y=[p0[1], p1[1]], z=[p0[2], p1[2]],
-            mode="lines",
-            line=dict(width=5, color=color),
-            name=name
-        )
-    traces.append(_axis_line(c, a1_u, sigma1, color_a1, "a1 axis"))
-    traces.append(_axis_line(c, a2_u, sigma2, color_a2, "a2 axis"))
-
-    layout = go.Layout(
-        title="Cylindrical axes (a1, a2) with half-length = sigma (total = 2*sigma)",
-        scene=dict(
-            xaxis=dict(title="X"),
-            yaxis=dict(title="Y"),
-            zaxis=dict(title="Z"),
-            aspectmode="data"
-        ),
-        legend=dict(x=1.02, y=1.0)
-    )
-
-    fig = go.Figure(data=traces, layout=layout)
-    fig.show()
-
-
+    result = nematic_from_contact_voxels(X_contacts, center, eps=eps)
+    axes_sigmas = extract_axes_sigmas(result)
+    return {
+        "N": result.N,
+        **axes_sigmas,
+        "n_valid": result.n_valid
+    }
 
 
 # -------------------------
