@@ -9,397 +9,10 @@ from sklearn.neighbors import NearestNeighbors
 import os
 import time
 import yaml
-
+from nematic_voxel import calculate_and_extract_nematic_results
+from simple_vector_measures import polarity_isotropic
 import numpy as np
-
-def unit_vectors(points, center):
-    """
-    Convert contact voxel coordinates into unit vectors
-    pointing from the cell center toward each contact voxel.
-    """
-    v = points - center[None, :]
-    return v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-12, None)
-
-
-def mean_dir_R(U):
-    """
-    Compute mean direction (unit vector) and concentration (R)
-    for a set of 3D unit vectors.
-    """
-    if len(U) == 0:
-        return np.array([np.nan, np.nan, np.nan]), 0.0
-    s = U.sum(axis=0)
-    s_norm = np.linalg.norm(s)
-    R = s_norm / len(U)
-    m = s / s_norm if s_norm > 0 else np.array([np.nan, np.nan, np.nan])
-    return m, R
-
-
-def cone_percentiles(U, axis):
-    """
-    Compute 50%, 68%, 95% angular half-cone spread (degrees)
-    around a given mean axis.
-    """
-    if len(U) == 0 or not np.isfinite(axis).all():
-        return np.array([np.nan, np.nan, np.nan])
-    theta = np.arccos(np.clip(U @ axis, -1.0, 1.0))
-    q = np.percentile(theta, [50, 68, 95])
-    return np.rad2deg(q)
-
-
-def polarity_isotropic(canal_vox, sinus_vox, com):
-    """
-    Compute 3D polarity based on canaliculi and sinusoid contact voxels.
-
-    Handles all cases:
-      - both present
-      - only one present
-      - neither present
-    """
-    # Convert inputs to arrays
-    canal_vox = np.asarray(canal_vox)
-    sinus_vox = np.asarray(sinus_vox)
-    com = np.asarray(com)
-
-    # Step 1: unit vectors from COM to contact voxels
-    Uc = unit_vectors(canal_vox, com) if canal_vox.size else np.empty((0, 3))
-    Us = unit_vectors(sinus_vox, com) if sinus_vox.size else np.empty((0, 3))
-
-    # Step 2: mean direction + concentration for each
-    mc, Rc = mean_dir_R(Uc)
-    ms, Rs = mean_dir_R(Us)
-
-    # Step 3: compute polarity depending on which contacts exist
-    if Rc > 0 and Rs > 0:
-        # Both canaliculi and sinusoid contacts present
-        p_raw = Rc * mc - Rs * ms
-    elif Rc > 0 and Rs == 0:
-        # Only canaliculi contacts → point toward canaliculi
-        p_raw = Rc * mc
-    elif Rs > 0 and Rc == 0:
-        # Only sinusoid contacts → point away from sinusoids
-        p_raw = -Rs * ms
-    else:
-        # Neither contact type present
-        p_raw = np.array([np.nan, np.nan, np.nan])
-
-    # Step 4: compute polarity strength and normalize axis
-    strength = np.linalg.norm(p_raw) if np.all(np.isfinite(p_raw)) else 0.0
-    polarity_axis = (
-        p_raw / strength if strength > 0 else np.array([np.nan, np.nan, np.nan])
-    )
-
-    # Step 5: angular spreads
-    coneC = cone_percentiles(Uc, mc)
-    coneS = cone_percentiles(Us, ms)
-
-    # Step 6: pack everything into a clean dictionary
-    return {
-        "canaliculi": {
-            "mean_dir": mc,
-            "R": Rc,
-            "cone_deg": {
-                "median": coneC[0],
-                "p68": coneC[1],
-                "p95": coneC[2],
-            },
-        },
-        "sinusoids": {
-            "mean_dir": ms,
-            "R": Rs,
-            "cone_deg": {
-                "median": coneS[0],
-                "p68": coneS[1],
-                "p95": coneS[2],
-            },
-        },
-        "polarity_axis": polarity_axis,   # final polarity direction (unit vector)
-        "polarity_strength": strength     # scalar (0–2 typical)
-    }
-
-import matplotlib.pyplot as plt
-from scipy.stats import circmean, circstd
-
-def plot_vector_field_2d(
-    polarity_csv_path: str,
-    cell_csv_path: str,
-    grid_size_um: float = 25.0,
-    plane: str = 'xz',
-    output_dir: str = None,
-    dataset_name: str = None,
-    arrow_scale: float = 30.0,
-    use_weighting: bool = False
-):
-    """
-    Plot 2D vector fields of canaliculi, sinusoid, and polarity vectors.
-    
-    Parameters:
-    -----------
-    polarity_csv_path : str
-        Path to the polarity vectors CSV file
-    cell_csv_path : str
-        Path to the cell CSV file with COM coordinates
-    grid_size_um : float or None
-        Grid size in micrometers for binning (default 25 μm).
-        If None or False, plot vectors at each cell's COM without binning.
-    plane : str
-        Plane to plot: 'xz' (average along y) or 'yz' (average along x)
-    output_dir : str
-        Directory to save plots (optional)
-    dataset_name : str
-        Name of dataset for plot titles
-    arrow_scale : float
-        Scale factor for arrow length
-    use_weighting : bool
-        If True, weight averages by contact counts (canaliculi/sinusoid) or polarity strength.
-        If False, use simple unweighted averages (default: True).
-        Note: Only applies when grid_size_um is set (binning is enabled).
-    """
-    # Load data
-    polarity_df = pd.read_csv(polarity_csv_path)
-    cell_df = pd.read_csv(cell_csv_path)
-    
-    # Merge to get COM coordinates
-    merged_df = polarity_df.merge(
-        cell_df[['Object ID', 'COM Z (nm)', 'COM Y (nm)', 'COM X (nm)']],
-        left_on='Cell ID',
-        right_on='Object ID',
-        how='left'
-    )
-    
-    # Filter out cells without valid polarity
-    valid_df = merged_df[merged_df['Polarity Strength'].notna()].copy()
-    
-    # Determine if binning is enabled
-    use_binning = grid_size_um not in [None, False]
-    
-    # Convert grid size from μm to nm if binning
-    if use_binning:
-        grid_size_nm = grid_size_um * 1000
-    
-    # Determine axes based on plane
-    if plane.lower() == 'xz':
-        # Average along Y, plot X vs Z
-        axis1_name, axis2_name, avg_axis_name = 'X', 'Z', 'Y'
-        axis1_col = 'COM X (nm)'
-        axis2_col = 'COM Z (nm)'
-        # Vector components for the plane
-        can_vec1, can_vec2 = 'Canaliculi Mean Dir X', 'Canaliculi Mean Dir Z'
-        sin_vec1, sin_vec2 = 'Sinusoids Mean Dir X', 'Sinusoids Mean Dir Z'
-        pol_vec1, pol_vec2 = 'Polarity Axis X', 'Polarity Axis Z'
-    else:  # 'yz'
-        # Average along X, plot Y vs Z
-        axis1_name, axis2_name, avg_axis_name = 'Y', 'Z', 'X'
-        axis1_col = 'COM Y (nm)'
-        axis2_col = 'COM Z (nm)'
-        can_vec1, can_vec2 = 'Canaliculi Mean Dir Y', 'Canaliculi Mean Dir Z'
-        sin_vec1, sin_vec2 = 'Sinusoids Mean Dir Y', 'Sinusoids Mean Dir Z'
-        pol_vec1, pol_vec2 = 'Polarity Axis Y', 'Polarity Axis Z'
-    
-    if use_binning:
-        # Create grid bins
-        axis1_min = valid_df[axis1_col].min()
-        axis1_max = valid_df[axis1_col].max()
-        axis2_min = valid_df[axis2_col].min()
-        axis2_max = valid_df[axis2_col].max()
-        
-        axis1_bins = np.arange(axis1_min, axis1_max + grid_size_nm, grid_size_nm)
-        axis2_bins = np.arange(axis2_min, axis2_max + grid_size_nm, grid_size_nm)
-        
-        # Assign grid cells
-        valid_df['grid_axis1'] = pd.cut(valid_df[axis1_col], bins=axis1_bins, labels=False)
-        valid_df['grid_axis2'] = pd.cut(valid_df[axis2_col], bins=axis2_bins, labels=False)
-        
-        # Prepare grid for storing averaged vectors
-        n_axis1 = len(axis1_bins) - 1
-        n_axis2 = len(axis2_bins) - 1
-        
-        grid_axis1_centers = (axis1_bins[:-1] + axis1_bins[1:]) / 2 / 1000  # Convert to μm
-        grid_axis2_centers = (axis2_bins[:-1] + axis2_bins[1:]) / 2 / 1000  # Convert to μm
-        
-        # Initialize storage for vectors
-        can_vec_field_1 = np.full((n_axis2, n_axis1), np.nan)
-        can_vec_field_2 = np.full((n_axis2, n_axis1), np.nan)
-        sin_vec_field_1 = np.full((n_axis2, n_axis1), np.nan)
-        sin_vec_field_2 = np.full((n_axis2, n_axis1), np.nan)
-        pol_vec_field_1 = np.full((n_axis2, n_axis1), np.nan)
-        pol_vec_field_2 = np.full((n_axis2, n_axis1), np.nan)
-        cell_counts = np.zeros((n_axis2, n_axis1), dtype=int)
-        
-        # Calculate averaged vectors for each grid cell
-        for i in range(n_axis1):
-            for j in range(n_axis2):
-                grid_data = valid_df[(valid_df['grid_axis1'] == i) & (valid_df['grid_axis2'] == j)]
-                
-                if len(grid_data) == 0:
-                    continue
-                
-                cell_counts[j, i] = len(grid_data)
-                
-                # Canaliculi vectors - weighted or unweighted
-                can_mask = grid_data[can_vec1].notna() & grid_data[can_vec2].notna()
-                if can_mask.sum() > 0:
-                    if use_weighting:
-                        # Weighted average by number of canaliculi contact voxels
-                        can_weights = grid_data.loc[can_mask, 'Num Canaliculi Contact Voxels'].values
-                        if can_weights.sum() > 0:
-                            can_vec_field_1[j, i] = np.average(grid_data.loc[can_mask, can_vec1], weights=can_weights)
-                            can_vec_field_2[j, i] = np.average(grid_data.loc[can_mask, can_vec2], weights=can_weights)
-                        else:
-                            can_vec_field_1[j, i] = grid_data.loc[can_mask, can_vec1].mean()
-                            can_vec_field_2[j, i] = grid_data.loc[can_mask, can_vec2].mean()
-                    else:
-                        # Simple unweighted average
-                        can_vec_field_1[j, i] = grid_data.loc[can_mask, can_vec1].mean()
-                        can_vec_field_2[j, i] = grid_data.loc[can_mask, can_vec2].mean()
-                # else: leave as NaN
-                
-                # Sinusoid vectors - weighted or unweighted
-                sin_mask = grid_data[sin_vec1].notna() & grid_data[sin_vec2].notna()
-                if sin_mask.sum() > 0:
-                    if use_weighting:
-                        # Weighted average by number of sinusoid contact voxels
-                        sin_weights = grid_data.loc[sin_mask, 'Num Sinusoid Contact Voxels'].values
-                        if sin_weights.sum() > 0:
-                            sin_vec_field_1[j, i] = np.average(grid_data.loc[sin_mask, sin_vec1], weights=sin_weights)
-                            sin_vec_field_2[j, i] = np.average(grid_data.loc[sin_mask, sin_vec2], weights=sin_weights)
-                        else:
-                            sin_vec_field_1[j, i] = grid_data.loc[sin_mask, sin_vec1].mean()
-                            sin_vec_field_2[j, i] = grid_data.loc[sin_mask, sin_vec2].mean()
-                    else:
-                        # Simple unweighted average
-                        sin_vec_field_1[j, i] = grid_data.loc[sin_mask, sin_vec1].mean()
-                        sin_vec_field_2[j, i] = grid_data.loc[sin_mask, sin_vec2].mean()
-                # else: leave as NaN
-                
-                # Polarity vectors - weighted or unweighted
-                pol_mask = grid_data[pol_vec1].notna() & grid_data[pol_vec2].notna() & grid_data['Polarity Strength'].notna()
-                if pol_mask.sum() > 0:
-                    if use_weighting:
-                        # Weighted average by polarity strength
-                        pol_weights = grid_data.loc[pol_mask, 'Polarity Strength'].values
-                        if pol_weights.sum() > 0:
-                            pol_vec_field_1[j, i] = np.average(grid_data.loc[pol_mask, pol_vec1], weights=pol_weights)
-                            pol_vec_field_2[j, i] = np.average(grid_data.loc[pol_mask, pol_vec2], weights=pol_weights)
-                        else:
-                            pol_vec_field_1[j, i] = grid_data.loc[pol_mask, pol_vec1].mean()
-                            pol_vec_field_2[j, i] = grid_data.loc[pol_mask, pol_vec2].mean()
-                    else:
-                        # Simple unweighted average
-                        pol_vec_field_1[j, i] = grid_data.loc[pol_mask, pol_vec1].mean()
-                        pol_vec_field_2[j, i] = grid_data.loc[pol_mask, pol_vec2].mean()
-                # else: leave as NaN
-        
-        # Create meshgrid for plotting
-        X, Y = np.meshgrid(grid_axis1_centers, grid_axis2_centers)
-    else:
-        # No binning: use cell COM positions directly
-        # Extract positions in μm
-        X = valid_df[axis1_col].values / 1000  # Convert nm to μm
-        Y = valid_df[axis2_col].values / 1000
-        
-        # Extract vector components
-        can_vec_field_1 = valid_df[can_vec1].values
-        can_vec_field_2 = valid_df[can_vec2].values
-        sin_vec_field_1 = valid_df[sin_vec1].values
-        sin_vec_field_2 = valid_df[sin_vec2].values
-        pol_vec_field_1 = valid_df[pol_vec1].values
-        pol_vec_field_2 = valid_df[pol_vec2].values
-    
-    
-    # Create figure with 3 subplots
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    
-    # Determine subtitle based on weighting (only applies when binning is enabled)
-    if use_binning:
-        weight_subtitle = "(weighted by contact voxel count)" if use_weighting else "(unweighted average)"
-        pol_weight_subtitle = "(weighted by polarity strength)" if use_weighting else "(unweighted average)"
-        avg_text = f", averaged along {avg_axis_name}"
-    else:
-        weight_subtitle = ""
-        pol_weight_subtitle = ""
-        avg_text = " at cell COM"
-    
-    # Plot 1: Canaliculi vectors (green)
-    ax = axes[0]
-    mask = ~np.isnan(can_vec_field_1)
-    # Note: scale is INVERSE to arrow length. Lower scale = longer arrows.
-    # For unit vectors (~0-1 magnitude), scale=10-50 works well.
-    # Alternatively, use scale_units='xy' for better control
-    ax.quiver(X[mask], Y[mask], can_vec_field_1[mask], can_vec_field_2[mask],
-              color='green', scale=arrow_scale, scale_units='xy', angles='xy', 
-              width=0.003, alpha=0.7)
-    ax.set_xlabel(f'{axis1_name} position (μm)', fontsize=12)
-    ax.set_ylabel(f'{axis2_name} position (μm)', fontsize=12)
-    ax.set_title(f'Canaliculi Mean Direction Vectors\n{weight_subtitle}{avg_text}', fontsize=14)
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    
-    # Plot 2: Sinusoid vectors (red)
-    ax = axes[1]
-    mask = ~np.isnan(sin_vec_field_1)
-    ax.quiver(X[mask], Y[mask], sin_vec_field_1[mask], sin_vec_field_2[mask],
-              color='red', scale=arrow_scale, scale_units='xy', angles='xy',
-              width=0.003, alpha=0.7)
-    ax.set_xlabel(f'{axis1_name} position (μm)', fontsize=12)
-    ax.set_ylabel(f'{axis2_name} position (μm)', fontsize=12)
-    ax.set_title(f'Sinusoid Mean Direction Vectors\n{weight_subtitle}{avg_text}', fontsize=14)
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    
-    # Plot 3: Polarity vectors (blue)
-    ax = axes[2]
-    mask = ~np.isnan(pol_vec_field_1)
-    ax.quiver(X[mask], Y[mask], pol_vec_field_1[mask], pol_vec_field_2[mask],
-              color='blue', scale=arrow_scale, scale_units='xy', angles='xy',
-              width=0.003, alpha=0.7)
-    ax.set_xlabel(f'{axis1_name} position (μm)', fontsize=12)
-    ax.set_ylabel(f'{axis2_name} position (μm)', fontsize=12)
-    ax.set_title(f'Polarity Vectors\n{pol_weight_subtitle}{avg_text}', fontsize=14)
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    
-    # Create main title based on binning mode
-    if use_binning:
-        main_title = f'Vector Field Analysis - {dataset_name} ({plane.upper()} plane, {grid_size_um}μm grid)' if dataset_name else f'Vector Field Analysis ({plane.upper()} plane, {grid_size_um}μm grid)'
-    else:
-        main_title = f'Vector Field Analysis - {dataset_name} ({plane.upper()} plane, per-cell)' if dataset_name else f'Vector Field Analysis ({plane.upper()} plane, per-cell)'
-    
-    plt.suptitle(main_title, fontsize=16, y=1.02)
-    plt.tight_layout()
-    
-    # Save if output directory provided
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        if use_binning:
-            weight_tag = "weighted" if use_weighting else "unweighted"
-            output_file = os.path.join(output_dir, f'vector_field_{plane}_{weight_tag}_{dataset_name}.png')
-        else:
-            output_file = os.path.join(output_dir, f'vector_field_{plane}_percell_{dataset_name}.png')
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"Saved plot to: {output_file}")
-    
-    plt.show()
-    
-    if use_binning:
-        return {
-            'grid_axis1_centers': grid_axis1_centers,
-            'grid_axis2_centers': grid_axis2_centers,
-            'canaliculi_vectors': (can_vec_field_1, can_vec_field_2),
-            'sinusoid_vectors': (sin_vec_field_1, sin_vec_field_2),
-            'polarity_vectors': (pol_vec_field_1, pol_vec_field_2),
-            'cell_counts': cell_counts
-        }
-    else:
-        return {
-            'positions': (X, Y),
-            'canaliculi_vectors': (can_vec_field_1, can_vec_field_2),
-            'sinusoid_vectors': (sin_vec_field_1, sin_vec_field_2),
-            'polarity_vectors': (pol_vec_field_1, pol_vec_field_2)
-        }
-
-
-# %%
+import json 
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
@@ -407,13 +20,14 @@ data_dir = cfg["FINAL_DATA_DIR"]
 analysis_dir = cfg["ANALYSIS_DIR"]
 skeleton_dir = cfg["SKELETON_DIR"]
 
-# %%
+
 def process_cell(
     cell_id: int,
     cell_df: pd.DataFrame,
     cell_idi: ImageDataInterface,
     canaliculi_contacts_idi: ImageDataInterface,
     sinusoid_contacts_idi: ImageDataInterface,
+    return_points=False,
 ) -> dict:
     try:
         # 1) Get cell COM coords
@@ -461,6 +75,11 @@ def process_cell(
         # 4) Calculate polarity if we have both contact types
         result = {"Cell ID": cell_id}
         
+        # Append com to results
+        result["COM Z (nm)"] = cell_com[0]
+        result["COM Y (nm)"] = cell_com[1]
+        result["COM X (nm)"] = cell_com[2]
+
         #if can_pts.size > 0 and sin_pts.size > 0:
         polarity_data = polarity_isotropic(can_pts, sin_pts, cell_com)
         
@@ -490,23 +109,33 @@ def process_cell(
         
         result["Num Canaliculi Contact Voxels"] = len(can_pts)
         result["Num Sinusoid Contact Voxels"] = len(sin_pts)
-        # else:
-        #     # Set NaN values if we don't have both contact types
-        #     for key in ["Canaliculi Mean Dir Z", "Canaliculi Mean Dir Y", "Canaliculi Mean Dir X",
-        #                "Canaliculi R", "Canaliculi Cone Median Deg", "Canaliculi Cone P68 Deg", "Canaliculi Cone P95 Deg",
-        #                "Sinusoids Mean Dir Z", "Sinusoids Mean Dir Y", "Sinusoids Mean Dir X",
-        #                "Sinusoids R", "Sinusoids Cone Median Deg", "Sinusoids Cone P68 Deg", "Sinusoids Cone P95 Deg",
-        #                "Polarity Axis Z", "Polarity Axis Y", "Polarity Axis X", "Polarity Strength"]:
-        #         result[key] = np.nan
-        #     result["Num Canaliculi Contact Voxels"] = len(can_pts) if can_pts.size > 0 else 0
-        #     result["Num Sinusoid Contact Voxels"] = len(sin_pts) if sin_pts.size > 0 else 0
-            
+
+        can_nematic_results = calculate_and_extract_nematic_results(
+            can_pts,
+            cell_com,
+        )
+        sin_nematic_results = calculate_and_extract_nematic_results(
+            sin_pts,
+            cell_com,
+        )
+        for n,r in zip(["Canaliculi", "Sinusoids"], [can_nematic_results, sin_nematic_results]):
+            vec_name = "a" if n=="Canaliculi" else "b"
+            for vec_num in [1,2]:
+                result[f"{n} {vec_name}{vec_num} Z"] = r[f"vec{vec_num}"][0]
+                result[f"{n} {vec_name}{vec_num} Y"] = r[f"vec{vec_num}"][1]
+                result[f"{n} {vec_name}{vec_num} X"] = r[f"vec{vec_num}"][2]
+                result[f"{n} {vec_name}{vec_num} sigma"] = r[f"sigma{vec_num}"]
+
+
     except Exception as e:
         print(f"[ERROR] cell {cell_id} raised: {e!r}")
         raise
+    if return_points:
+        # Append contact points to results as strings
+       return cell_com, can_pts, sin_pts, result
     return result
 
-
+# %%
 if __name__ == "__main__":
     for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
         print(f"\nProcessing dataset: {dataset}")
@@ -559,34 +188,75 @@ if __name__ == "__main__":
 
 
 # %%
-# Example usage - uncomment to run plotting
+# # Example usage - uncomment to run plotting
+# for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
+#     polarity_csv = f"{analysis_dir}/{dataset}/tmp_secondary_results/cell_polarity_vectors.csv"
+#     cell_csv = f"{analysis_dir}/{dataset}/cell_assignments/cell.csv"
+#     output_dir = f"{analysis_dir}/{dataset}/tmp_secondary_results/plots"
+    
+#     # Plot 2D vector fields - BINNED AND WEIGHTED (default)
+#     # XZ plane (averaged along Y)
+#     # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='xz',
+#     #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.05,
+#     #                      use_weighting=True)
+    
+#     # Optionally: Plot UNWEIGHTED versions for comparison
+#     # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=25, plane='xz',
+#     #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025,
+#     #                      use_weighting=False)
+    
+#     # Optionally: Plot WITHOUT BINNING (per-cell vectors at COM)
+#     # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='xz',
+#     #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025)
+#     # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='yz',
+#     #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025)
+    
+#     # Original polarity vs Z plots
+#     # plot_polarity_vs_z(polarity_csv, cell_csv, bin_size_um=25, average_axis='x', 
+#     #                    output_dir=output_dir, dataset_name=dataset)
+#     # plot_polarity_vs_z(polarity_csv, cell_csv, bin_size_um=25, average_axis='y', 
+#     #                    output_dir=output_dir, dataset_name=dataset)
+
+from vis import plot_projected_axes_from_csv
 for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
     polarity_csv = f"{analysis_dir}/{dataset}/tmp_secondary_results/cell_polarity_vectors.csv"
-    cell_csv = f"{analysis_dir}/{dataset}/cell_assignments/cell.csv"
-    output_dir = f"{analysis_dir}/{dataset}/tmp_secondary_results/plots"
-    
-    # Plot 2D vector fields - BINNED AND WEIGHTED (default)
-    # XZ plane (averaged along Y)
-    plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='xz',
-                         output_dir=output_dir, dataset_name=dataset, arrow_scale=.05,
-                         use_weighting=True)
-    
-    # Optionally: Plot UNWEIGHTED versions for comparison
-    # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=25, plane='xz',
-    #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025,
-    #                      use_weighting=False)
-    
-    # Optionally: Plot WITHOUT BINNING (per-cell vectors at COM)
-    # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='xz',
-    #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025)
-    # plot_vector_field_2d(polarity_csv, cell_csv, grid_size_um=None, plane='yz',
-    #                      output_dir=output_dir, dataset_name=dataset, arrow_scale=.025)
-    
-    # Original polarity vs Z plots
-    # plot_polarity_vs_z(polarity_csv, cell_csv, bin_size_um=25, average_axis='x', 
-    #                    output_dir=output_dir, dataset_name=dataset)
-    # plot_polarity_vs_z(polarity_csv, cell_csv, bin_size_um=25, average_axis='y', 
-    #                    output_dir=output_dir, dataset_name=dataset)
+    for base in ["Canaliculi a1", "Canaliculi a2","Sinusoids b1", "Sinusoids b2"]:
+        for smoothing_std in [None, 20]:
+            print(f"Plotting {base} for dataset {dataset} with smoothing={smoothing_std}")
+            plot_projected_axes_from_csv(csv_path=polarity_csv, bases=[base], plane="YZ", length_3d=5000.0, smoothing_std_um=smoothing_std, colors_for_bases={base:"green"}, com_alpha=0.1)
 
+# %% plot individual cells
+from vis import plot_projected_points_with_two_vectors, plot_mollweide_polarity
+canaliculi_contacts_idi = ImageDataInterface(
+    f"{data_dir}/{dataset}/{dataset}.zarr//recon-1/labels/inference/segmentations/canaliculi_cell_contacts/s0"
+)
+sinusoid_contacts_idi = ImageDataInterface(
+    f"{data_dir}/{dataset}/{dataset}.zarr//recon-1/labels/inference/segmentations/sinusoid_cell_contacts/s0"
+)
 
+cell_idi = ImageDataInterface(
+    f"{data_dir}/{dataset}/{dataset}.zarr//recon-1/labels/inference/segmentations/cell/s0",
+    output_voxel_size=Coordinate(128, 128, 128),
+)
+
+cell_df = pd.read_csv(f"{analysis_dir}/{dataset}/cell_assignments/cell.csv")
+unique_cells = cell_df["Object ID"].to_numpy()
+cell_com, can_pts, sin_pts, results = process_cell(
+    cell_id=1112,
+    cell_df=cell_df,
+    cell_idi=cell_idi,
+    canaliculi_contacts_idi=canaliculi_contacts_idi,
+    sinusoid_contacts_idi=sinusoid_contacts_idi,
+    return_points=True,
+)
+a1 = np.array([results["Canaliculi a1 Z"], results["Canaliculi a1 Y"], results["Canaliculi a1 X"]])
+a2 = np.array([results["Canaliculi a2 Z"], results["Canaliculi a2 Y"], results["Canaliculi a2 X"]])
+b1 = np.array([results["Sinusoids b1 Z"], results["Sinusoids b1 Y"], results["Sinusoids b1 X"]])
+b2 = np.array([results["Sinusoids b2 Z"], results["Sinusoids b2 Y"], results["Sinusoids b2 X"]])
+plot_projected_points_with_two_vectors(can_pts, cell_com, vec1=a1, vec2=a2,sigma1=results["Canaliculi a1 sigma"], sigma2=results["Canaliculi a2 sigma"], vector_scale=3, point_size_proj=0.5)
+# %%
+plot_projected_points_with_two_vectors(sin_pts, cell_com, vec1=b1, vec2=b2,sigma1=results["Sinusoids b1 sigma"], sigma2=results["Sinusoids b2 sigma"], vector_scale=3, point_size_proj=0.5)
+
+# %%
+plot_mollweide_polarity(a1, b1, cell_com, can_pts=can_pts)
 # %%
