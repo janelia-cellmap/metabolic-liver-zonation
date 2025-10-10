@@ -2,6 +2,7 @@
 import matplotlib.pyplot as plt
 from scipy.stats import circmean, circstd
 import os
+import pandas as pd
 
 def plot_vector_field_2d(
     polarity_csv_path: str,
@@ -389,160 +390,146 @@ def plot_cloud_and_vectors(
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
     plt.tight_layout()
     plt.show()
-
 import numpy as np
 import plotly.graph_objects as go
 
 import numpy as np
 import plotly.graph_objects as go
 
-import numpy as np
-import plotly.graph_objects as go
-
-def plot_cloud_and_axes_plotly(
+def plot_projected_points_with_two_vectors(
     X: np.ndarray,
-    cap_mask: np.ndarray,
-    a1: np.ndarray,
-    a2: np.ndarray,
+    c: np.ndarray,
+    vec1: np.ndarray,
+    vec2: np.ndarray,
     sigma1: float,
     sigma2: float,
-    c: np.ndarray = None,
-    radius: float = 0.03,
-    color_all: str = "rgba(31,119,180,0.35)",
-    color_cap: str = "rgba(255,127,14,0.95)",
-    color_a1: str = "red",
-    color_a2: str = "green",
-    point_size_all: float = 2.0,
-    point_size_cap: float = 3.0,
-    show_sphere: bool = True,
-    sphere_opacity: float = 0.12,
-    n_theta: int = 48,
-    n_s: int = 16,
+    # vector scaling
+    vector_scale: float = 1.0,          # global multiplier applied to both sigmas
+    symmetric_vectors: bool = False,    # False: ray c->(c+scaled vec); True: line through c
+    # visuals
+    show_original_points: bool = False,
+    show_rays: bool = False,            # rays from c to projected points
+    sphere_opacity: float = 0.18,
+    point_size_proj: float = 4.0,
+    point_size_orig: float = 2.0,
+    color_proj: str = "rgba(255,127,14,0.95)",
+    color_orig: str = "rgba(31,119,180,0.35)",
+    color_rays: str = "rgba(0,0,0,0.25)",
+    color_sphere: str = "lightgray",
+    color_vec1: str = "red",
+    color_vec2: str = "green",
+    # sphere mesh quality
+    n_theta: int = 96,
+    n_phi: int = 48,
+    title: str = "Unit-sphere projection with vec1/vec2",
+    show: bool = False,                 # avoid double-render in notebooks; call fig.show() yourself if desired
 ):
     """
-    Plots:
-      - all points X (one color),
-      - cap points X_cap (another color),
-      - a1 and a2 as CYLINDERS centered at c and extending equally
-        in +/- directions with half-length = sigma (total length = 2*sigma).
+    Projects points X onto the unit sphere centered at c and plots:
+      - transparent sphere mesh
+      - projected points
+      - two vectors (vec1, vec2) named 'vec1' and 'vec2'
 
-    Cylinder parameterization (simplest & robust):
-      P(θ, s) = c + s*u + r*(cosθ*b1 + sinθ*b2),
-      where u = a/||a||, b1,b2 form an orthonormal basis perpendicular to u,
-      θ in [0, 2π), s in [-sigma, +sigma].
+    Vector scaling:
+      Let s1 = vector_scale * sigma1, s2 = vector_scale * sigma2.
+      If symmetric_vectors=False: draw rays c -> c + s1*vec1 and c -> c + s2*vec2 (sign flips direction).
+      If symmetric_vectors=True: draw lines through c with half-length |s|*||vec|| along ±(vec/||vec||).
     """
+    # --- prep & projection ---
+    X = np.asarray(X, float).reshape(-1, 3)
+    c = np.asarray(c, float).reshape(3)
 
-    def _normalize(v):
-        v = np.asarray(v, float).reshape(3)
-        n = np.linalg.norm(v)
-        return v / (n + 1e-12)
+    V = X - c
+    norms = np.linalg.norm(V, axis=1)
+    good = norms > 1e-12
 
-    def _frame_from_dir(vhat):
-        """Return orthonormal (u, b1, b2) given unit vhat as u."""
-        u = _normalize(vhat)
-        # pick a temp vector not parallel to u
-        tmp = np.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        b1 = np.cross(u, tmp)
-        b1 = b1 / (np.linalg.norm(b1) + 1e-12)
-        b2 = np.cross(u, b1)
-        return u, b1, b2
+    U = np.zeros_like(V)
+    U[good] = V[good] / norms[good, None]  # unit directions
+    X_proj = c + U                          # unit sphere projection (R=1)
 
-    def _cylinder_pm(c0, a, sigma, r, n_theta=48, n_s=16):
-        """
-        Cylinder centered at c0, axis along 'a' (unit direction used),
-        extending from s=-sigma to s=+sigma.
-        Returns (X, Y, Z) meshes for go.Surface.
-        """
-        c0 = np.asarray(c0, float).reshape(3)
-        u, b1, b2 = _frame_from_dir(a)
+    # --- sphere mesh ---
+    u = np.linspace(0, 2*np.pi, n_theta)
+    v = np.linspace(0, np.pi, n_phi)
+    uu, vv = np.meshgrid(u, v)
+    xs = c[0] + np.cos(uu) * np.sin(vv)
+    ys = c[1] + np.sin(uu) * np.sin(vv)
+    zs = c[2] + np.cos(vv)
 
-        theta = np.linspace(0, 2*np.pi, n_theta)
-        s = np.linspace(-sigma, +sigma, n_s)
-        Theta, S = np.meshgrid(theta, s)  # (n_s, n_theta)
+    traces = [go.Surface(
+        x=xs, y=ys, z=zs,
+        showscale=False,
+        opacity=sphere_opacity,
+        colorscale=[[0, color_sphere], [1, color_sphere]],
+        hoverinfo="skip",
+        name="unit sphere"
+    )]
 
-        # P(θ, s) = c + s*u + r*(cosθ*b1 + sinθ*b2)
-        cosT, sinT = np.cos(Theta), np.sin(Theta)
-        X = c0[0] + S * u[0] + r * (cosT * b1[0] + sinT * b2[0])
-        Y = c0[1] + S * u[1] + r * (cosT * b1[1] + sinT * b2[1])
-        Z = c0[2] + S * u[2] + r * (cosT * b1[2] + sinT * b2[2])
-        return X, Y, Z
-
-    # defaults / data prep
-    if c is None:
-        c = np.zeros(3, dtype=float)
-    X = np.asarray(X, float)
-    X_cap = X[cap_mask]
-
-    # unit directions (display length comes only from sigmas)
-    a1_u = _normalize(a1)
-    a2_u = _normalize(a2)
-
-    # build traces
-    traces = []
-
-    # All points
-    traces.append(go.Scatter3d(
-        x=X[:, 0], y=X[:, 1], z=X[:, 2],
-        mode="markers",
-        marker=dict(size=point_size_all, color=color_all),
-        name="X (all)"
-    ))
-
-    # Cap points
-    traces.append(go.Scatter3d(
-        x=X_cap[:, 0], y=X_cap[:, 1], z=X_cap[:, 2],
-        mode="markers",
-        marker=dict(size=point_size_cap, color=color_cap),
-        name="X_cap"
-    ))
-
-    # Optional unit sphere for context
-    if show_sphere:
-        u = np.linspace(0, 2*np.pi, 80)
-        v = np.linspace(0, np.pi, 40)
-        uu, vv = np.meshgrid(u, v)
-        xs = np.cos(uu) * np.sin(vv)
-        ys = np.sin(uu) * np.sin(vv)
-        zs = np.cos(vv)
-        traces.append(go.Surface(
-            x=xs, y=ys, z=zs,
-            showscale=False,
-            opacity=sphere_opacity,
-            colorscale=[[0, "lightgray"], [1, "lightgray"]],
-            hoverinfo="skip",
-            name="unit sphere"
+    # --- optional original points ---
+    if show_original_points and np.any(good):
+        traces.append(go.Scatter3d(
+            x=X[good, 0], y=X[good, 1], z=X[good, 2],
+            mode="markers",
+            marker=dict(size=point_size_orig, color=color_orig),
+            name="original points"
         ))
 
-    # Cylinders for a1 (half-length sigma1) and a2 (half-length sigma2)
-    X1, Y1, Z1 = _cylinder_pm(c, a1_u, sigma1, radius, n_theta=n_theta, n_s=n_s)
-    X2, Y2, Z2 = _cylinder_pm(c, a2_u, sigma2, radius, n_theta=n_theta, n_s=n_s)
+    # --- projected points ---
+    if np.any(good):
+        traces.append(go.Scatter3d(
+            x=X_proj[good, 0], y=X_proj[good, 1], z=X_proj[good, 2],
+            mode="markers",
+            marker=dict(size=point_size_proj, color=color_proj),
+            name="projected points"
+        ))
 
-    traces.append(go.Surface(
-        x=X1, y=Y1, z=Z1, showscale=False, opacity=0.98,
-        colorscale=[[0, color_a1], [1, color_a1]],
-        name=f"a1 (total len={2*sigma1:.3f})"
-    ))
-    traces.append(go.Surface(
-        x=X2, y=Y2, z=Z2, showscale=False, opacity=0.98,
-        colorscale=[[0, color_a2], [1, color_a2]],
-        name=f"a2 (total len={2*sigma2:.3f})"
-    ))
-
-    # Optional thin axis lines to emphasize exact endpoints
-    def _axis_line(c0, uhat, sigma, color, name):
-        p0 = c0 - uhat * sigma
-        p1 = c0 + uhat * sigma
-        return go.Scatter3d(
-            x=[p0[0], p1[0]], y=[p0[1], p1[1]], z=[p0[2], p1[2]],
+    # --- optional rays from center to projected points ---
+    if show_rays and np.any(good):
+        x_lines, y_lines, z_lines = [], [], []
+        for p in X_proj[good]:
+            x_lines += [c[0], p[0], np.nan]
+            y_lines += [c[1], p[1], np.nan]
+            z_lines += [c[2], p[2], np.nan]
+        traces.append(go.Scatter3d(
+            x=x_lines, y=y_lines, z=z_lines,
             mode="lines",
-            line=dict(width=5, color=color),
+            line=dict(width=2, color=color_rays),
+            name="rays (c→proj)"
+        ))
+
+    # --- two vectors: vec1, vec2 ---
+    vec1 = np.asarray(vec1, float).reshape(3)
+    vec2 = np.asarray(vec2, float).reshape(3)
+    s1 = float(vector_scale) * float(sigma1)
+    s2 = float(vector_scale) * float(sigma2)
+
+    def _add_vector(vec, s, color, name):
+        n = np.linalg.norm(vec)
+        if n < 1e-12:
+            return
+        if symmetric_vectors:
+            # line through c with half-length = |s| * ||vec||
+            half_len = abs(s) * n
+            uhat = vec / n
+            p0 = c - uhat * half_len
+            p1 = c + uhat * half_len
+        else:
+            # one-sided ray: c -> c + s*vec  (sign flips direction)
+            p0 = c
+            p1 = c + s * vec
+        traces.append(go.Scatter3d(
+            x=[p0[0], p1[0]],
+            y=[p0[1], p1[1]],
+            z=[p0[2], p1[2]],
+            mode="lines",
+            line=dict(width=6, color=color),
             name=name
-        )
-    traces.append(_axis_line(c, a1_u, sigma1, color_a1, "a1 axis"))
-    traces.append(_axis_line(c, a2_u, sigma2, color_a2, "a2 axis"))
+        ))
+
+    _add_vector(vec1, s1, color_vec1, "vec1")
+    _add_vector(vec2, s2, color_vec2, "vec2")
 
     layout = go.Layout(
-        title="Cylindrical axes (a1, a2) with half-length = sigma (total = 2*sigma)",
+        title=title,
         scene=dict(
             xaxis=dict(title="X"),
             yaxis=dict(title="Y"),
@@ -553,5 +540,413 @@ def plot_cloud_and_axes_plotly(
     )
 
     fig = go.Figure(data=traces, layout=layout)
-    fig.show()
+    if show:
+        fig.show()
+    return fig
 
+
+
+# %%
+# Plotting from the paper:
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from numpy.linalg import eig
+
+# ----------------- helpers -----------------
+
+def _unit(v, eps=1e-12):
+    v = np.asarray(v, float)
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    return v / np.maximum(n, eps)
+
+def _plane_indices(plane: str):
+    plane = plane.upper()
+    if plane == "XY": return 0, 1
+    if plane == "XZ": return 0, 2
+    if plane == "YZ": return 1, 2
+    raise ValueError("plane must be 'XY', 'XZ', or 'YZ'")
+
+def _columns_for_base(df: pd.DataFrame, base: str):
+    """Return column names (Xcol, Ycol, Zcol) for a base like 'Canaliculi a1'."""
+    def pick(suffix):
+        target = f"{base} {suffix}"
+        # exact match first
+        for c in df.columns:
+            if c == target:
+                return c
+        # case-insensitive fallback
+        target_low = target.lower()
+        for c in df.columns:
+            if c.lower() == target_low:
+                return c
+        raise KeyError(f"Missing column '{target}'")
+    return pick("X"), pick("Y"), pick("Z")
+
+def _get_com_columns(df: pd.DataFrame):
+    for triplet in [
+        ("COM X (nm)", "COM Y (nm)", "COM Z (nm)"),
+        ("COM X", "COM Y", "COM Z"),
+        ("Center X", "Center Y", "Center Z"),
+    ]:
+        if all(c in df.columns for c in triplet):
+            return triplet
+    raise KeyError("Could not find COM columns (try 'COM X (nm)', 'COM Y (nm)', 'COM Z (nm)').")
+
+def _convert_units(arr, from_units: str):
+    fu = (from_units or "").lower()
+    if fu in ("um","µm","micron","microns"): return arr.astype(float), 1.0
+    if fu in ("nm","nanometer","nanometers"): return arr.astype(float)*1e-3, 1e-3
+    if fu in ("mm","millimeter","millimeters"): return arr.astype(float)*1e3, 1e3
+    return arr.astype(float), 1.0  # assume already µm
+
+def _gaussian_weights(d2, sigma):
+    return np.exp(-0.5 * d2 / (sigma**2))
+
+def _principal_axis(N):
+    vals, vecs = eig(N)
+    v = vecs[:, np.argmax(vals.real)].real
+    return _unit(v.ravel())
+
+def _nematic_weighted(vecs_unit, weights):
+    """
+    vecs_unit: (M,3) valid unit vectors for neighbors
+    weights: (M,) weights
+    returns Nx3x3 nematic (here single 3x3)
+    """
+    I = np.eye(3)
+    # <aa^T>_w
+    aa = np.einsum("mi,mj->mij", vecs_unit, vecs_unit)  # (M,3,3)
+    wsum = weights.sum() + 1e-12
+    mean_aa = (weights[:, None, None] * aa).sum(axis=0) / wsum
+    N = 1.5 * (mean_aa - I/3.0)
+    return N
+
+# ----------------- main function -----------------
+
+def plot_projected_axes_from_csv(
+    csv_path: str,
+    bases: list,                     # e.g., ["Canaliculi a1"] or multiple
+    plane: str = "XZ",               # "XY" | "XZ" | "YZ"
+    length_3d: float = 1.0,          # half-length in 3D BEFORE projection (same units as COM)
+    com_units: str = "nm",
+    smoothing_std_um: float = None,  # e.g., 20.0 for local averaging in µm
+    sigma_column: str = None,        # optional: name of per-row sigma column that must be finite to count as valid
+    colors_for_bases: dict = None,   # optional mapping base->color for line segments
+    figsize=(7,6),
+    com_size=10,
+    com_alpha=0.8,
+):
+    """
+    - COM points are plotted: blue if row is valid (finite vector components for ALL requested bases,
+      and finite sigma_column if provided), red otherwise.
+    - For each requested base, we draw line segments centered at COM in +/- direction using the 3D
+      direction (possibly smoothed), with half-length = length_3d. Then we project endpoints to the plane.
+    - If a row is invalid, no line is drawn for it.
+    """
+
+    df = pd.read_csv(csv_path)
+    px, py = _plane_indices(plane)
+    axis_labels = ["X","Y","Z"]
+
+    # COMs
+    com_x, com_y, com_z = _get_com_columns(df)
+    COM = df[[com_x, com_y, com_z]].to_numpy(float)
+    COM_plot2D = COM[:, [px, py]]
+
+    # COM in µm (for smoothing geometry)
+    COM_um, _ = _convert_units(COM, com_units)
+
+    # validity mask per row:
+    # - vector components for each requested base must be finite
+    valid = np.ones(len(df), dtype=bool)
+    base_cols = {}
+    for base in bases:
+        cx, cy, cz = _columns_for_base(df, base)
+        base_cols[base] = (cx, cy, cz)
+        V = df[[cx, cy, cz]].to_numpy(float)
+        valid &= np.all(np.isfinite(V), axis=1)
+
+    if sigma_column is not None:
+        if sigma_column not in df.columns:
+            raise KeyError(f"Specified sigma_column '{sigma_column}' not found in CSV.")
+        valid &= np.isfinite(df[sigma_column].to_numpy(float))
+
+    # scatter COMs: blue=valid, red=invalid
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(
+        COM_plot2D[~valid, 0], COM_plot2D[~valid, 1],
+        c="red", s=com_size, alpha=com_alpha, label="COM (invalid)"
+    )
+    ax.scatter(
+        COM_plot2D[valid, 0], COM_plot2D[valid, 1],
+        c="blue", s=com_size, alpha=com_alpha, label="COM (valid)"
+    )
+
+    # Precompute kd-ish full pairwise d2 if smoothing requested (only among valid rows)
+    if smoothing_std_um is not None and smoothing_std_um > 0:
+        Pv = COM_um[valid]                      # (Nv,3)
+        d2_full = np.sum((Pv[:, None, :] - Pv[None, :, :])**2, axis=-1)  # (Nv,Nv)
+
+    # per-base plotting
+    if colors_for_bases is None:
+        # cycle basic colors; you can override
+        default_colors = ["tab:orange", "tab:green", "tab:purple", "tab:brown", "tab:pink"]
+        colors_for_bases = {b: default_colors[i % len(default_colors)] for i, b in enumerate(bases)}
+
+    for base in bases:
+        cx, cy, cz = base_cols[base]
+        V = df[[cx, cy, cz]].to_numpy(float)         # (N,3)
+        V = V[valid]                                  # only valid rows
+        V = _unit(V)                                  # unit 3D directions
+        C = COM[valid]                                # (Nv,3)
+
+        # smoothing (on valid rows only)
+        if smoothing_std_um is not None and smoothing_std_um > 0:
+            # recompute V at each valid row via nematic-weighted average of all valid rows
+            V_s = np.zeros_like(V)
+            for i in range(len(V)):
+                w = _gaussian_weights(d2_full[i], smoothing_std_um)
+                N = _nematic_weighted(V, w)
+                V_s[i] = _principal_axis(N)
+            V = V_s
+
+        # For each valid row: build 3D endpoints before projection
+        # endpoints_3D = C +/- length_3d * V
+        P_minus_3D = C - length_3d * V
+        P_plus_3D  = C + length_3d * V
+
+        # project endpoints to the chosen 2D plane
+        Pm2 = P_minus_3D[:, [px, py]]
+        Pp2 = P_plus_3D[:, [px, py]]
+
+        color = colors_for_bases[base]
+        # draw segments
+        for p0, p1 in zip(Pm2, Pp2):
+            ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=color, linewidth=1.8)
+
+        # legend proxy
+        if len(Pm2) > 0:
+            ax.plot([Pm2[0,0], Pp2[0,0]], [Pm2[0,1], Pp2[0,1]],
+                    color=color, linewidth=2.5, label=base)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(axis_labels[px] + (f" ({com_units})" if com_units else ""))
+    ax.set_ylabel(axis_labels[py] + (f" ({com_units})" if com_units else ""))
+    title = f"Projected {bases} on {plane} (segments built in 3D, half-length={length_3d} {com_units})"
+    if smoothing_std_um and smoothing_std_um > 0:
+        title += f"  |  smoothing σ={smoothing_std_um} µm"
+    ax.set_title(title)
+    ax.legend(loc="best")
+    plt.tight_layout()
+    plt.show()
+
+#%% Mollweide projection of spherical data
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------- geometry helpers ----------
+def _normalize(v, eps=1e-12):
+    v = np.asarray(v, float).reshape(-1)
+    n = np.linalg.norm(v)
+    if n < eps:
+        return v * 0.0, 0.0
+    return v / n, n
+
+def _orthonormal_frame(a1, b1):
+    """
+    Build a right-handed orthonormal basis tied to the cell:
+      ẑ := b1̂  (north/south)
+      x̂ := normalized projection of a1 onto the plane ⟂ ẑ  (zero meridian direction on equator)
+      ŷ := ẑ × x̂
+    If a1 ~ parallel to b1, pick a stable fallback for x̂.
+    """
+    zhat, nz = _normalize(b1)
+    if nz == 0:
+        raise ValueError("b1 must be nonzero to define the N–S axis")
+
+    # remove b1 component from a1
+    a1 = np.asarray(a1, float).reshape(3)
+    a1_par = np.dot(a1, zhat) * zhat
+    x_try = a1 - a1_par
+    nx = np.linalg.norm(x_try)
+
+    if nx < 1e-8:
+        # a1 is (near) parallel to b1; choose any vector ⟂ zhat deterministically
+        tmp = np.array([1.0, 0.0, 0.0]) if abs(zhat[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        x_try = np.cross(zhat, tmp)
+        nx = np.linalg.norm(x_try)
+
+    xhat = x_try / (nx + 1e-12)
+    yhat = np.cross(zhat, xhat)
+    yhat, _ = _normalize(yhat)
+
+    # re-orthogonalize xhat just in case
+    xhat = np.cross(yhat, zhat)
+    xhat, _ = _normalize(xhat)
+
+    return xhat, yhat, zhat  # (prime meridian dir on equator, eastward, north)
+
+def _project_to_unit_sphere(P, c):
+    """Radially project 3D points to unit sphere centered at c."""
+    P = np.asarray(P, float).reshape(-1, 3)
+    c = np.asarray(c, float).reshape(3)
+    V = P - c
+    r = np.linalg.norm(V, axis=1)
+    good = r > 1e-12
+    U = np.zeros_like(V)
+    U[good] = V[good] / r[good, None]
+    return U, good
+
+def _spherical_coords_in_frame(U, xhat, yhat, zhat):
+    """
+    Convert unit vectors U to (lon λ, lat φ) in radians
+    for the cell-centric frame (x̂=0° meridian, ŷ=+90°E, ẑ=north).
+    """
+    U = np.asarray(U, float).reshape(-1, 3)
+    # latitude via dot with north
+    phi = np.arcsin(np.clip(U @ zhat, -1.0, 1.0))            # φ ∈ [-π/2, π/2]
+    # longitude via atan2 in the equatorial plane (x=cosλ, y=sinλ)
+    x = U @ xhat
+    y = U @ yhat
+    lam = np.arctan2(y, x)                                   # λ ∈ (-π, π]
+    return lam, phi
+
+# ---------- Mollweide projection ----------
+def _mollweide_forward(lam, phi, tol=1e-12, max_iter=16):
+    """
+    Forward Mollweide projection for arrays of longitudes (λ) and latitudes (φ).
+    Returns (x,y). λ, φ in radians, λ ∈ [-π, π].
+    Equations:
+      Solve for θ: 2θ + sin(2θ) = π sin φ
+      x = (2√2/π) * λ * cos θ
+      y = √2 * sin θ
+    """
+    lam = np.asarray(lam, float)
+    phi = np.asarray(phi, float)
+    # initial guess: θ0 = φ
+    theta = phi.copy()
+
+    # Newton iterations on f(θ) = 2θ + sin(2θ) - π sin φ
+    for _ in range(max_iter):
+        two_theta = 2.0 * theta
+        f = two_theta + np.sin(two_theta) - np.pi * np.sin(phi)
+        df = 2.0 + 2.0 * np.cos(two_theta)  # derivative wrt θ
+        step = f / (df + 1e-16)
+        theta_new = theta - step
+        if np.max(np.abs(step)) < tol:
+            theta = theta_new
+            break
+        theta = theta_new
+
+    # map to plane
+    const = 2.0 * np.sqrt(2.0) / np.pi
+    x = const * lam * np.cos(theta)
+    y = np.sqrt(2.0) * np.sin(theta)
+    return x, y
+
+# ---------- main plotting function ----------
+def plot_mollweide_polarity(
+    a1, b1, c,
+    can_pts=None,     # apical points (N_a,3) in world coords
+    sin_pts=None,     # basal  points (N_b,3) in world coords
+    # styling
+    figsize=(7.5, 4.5),
+    show_graticule=True,
+    grid_step_deg=30,      # graticule every 30°
+    can_style=dict(marker='o', ms=4, lw=0, alpha=0.9, color='#d95f02', label='apical (can)'),
+    sin_style=dict(marker='o', ms=4, lw=0, alpha=0.9, color='#1f77b4', label='basal (sin)'),
+    pole_style=dict(marker='o', ms=6, color='k', lw=0, zorder=5),
+    meridian_color='#444',
+    equator_color='#444',
+    outline_color='#222',
+    title="Mollweide projection (b1 = N–S, a1 = 0° meridian)"
+):
+    """
+    Make a Mollweide map where:
+      - b1 defines the north/south axis
+      - a1 defines the zero meridian (vertical centerline)
+      - Points are first radially projected onto the unit sphere centered at c
+      - Both apical (can_pts) and basal (sin_pts) can be plotted if provided
+    """
+    a1 = np.asarray(a1, float).reshape(3)
+    b1 = np.asarray(b1, float).reshape(3)
+    c  = np.asarray(c,  float).reshape(3)
+
+    # cell-centric orthonormal frame
+    xhat, yhat, zhat = _orthonormal_frame(a1, b1)
+
+    # project + convert to lon/lat
+    def points_to_xy(P):
+        if P is None:
+            return np.empty((0,)), np.empty((0,))
+        U, good = _project_to_unit_sphere(P, c)
+        U = U[good]
+        if U.size == 0:
+            return np.empty((0,)), np.empty((0,))
+        lam, phi = _spherical_coords_in_frame(U, xhat, yhat, zhat)
+        return _mollweide_forward(lam, phi)
+
+    x_can, y_can = points_to_xy(can_pts)
+    x_sin, y_sin = points_to_xy(sin_pts)
+
+    # figure + axes
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_title(title)
+
+    # outline ellipse of Mollweide (x in [-2√2, 2√2], y in [-√2, √2])
+    R_x = 2.0 * np.sqrt(2.0)
+    R_y = np.sqrt(2.0)
+    tt = np.linspace(0, 2*np.pi, 600)
+    outline_x = R_x * np.cos(tt)
+    outline_y = R_y * np.sin(tt)
+    ax.plot(outline_x, outline_y, color=outline_color, lw=1.0)
+
+    # graticule (optional)
+    if show_graticule:
+        # meridians (λ constant)
+        for lam_deg in range(-150, 181, grid_step_deg):
+            lam = np.deg2rad(lam_deg)
+            phis = np.linspace(-np.pi/2, np.pi/2, 241)
+            xs, ys = _mollweide_forward(lam * np.ones_like(phis), phis)
+            ax.plot(xs, ys, color='#cccccc', lw=0.7, alpha=0.8, zorder=0)
+            if lam_deg % 60 == 0 and lam_deg != 0:
+                ax.text(xs[len(xs)//2], ys[len(ys)//2], f'{lam_deg}°', fontsize=8, ha='center', va='center', color='#888')
+
+        # parallels (φ constant)
+        for phi_deg in range(-60, 61, grid_step_deg):
+            phi = np.deg2rad(phi_deg)
+            lams = np.linspace(-np.pi, np.pi, 361)
+            xs, ys = _mollweide_forward(lams, phi * np.ones_like(lams))
+            ax.plot(xs, ys, color='#cccccc', lw=0.7, alpha=0.8, zorder=0)
+            if phi_deg != 0:
+                ax.text(xs[-1] - 0.05, ys[-1], f'{phi_deg}°', fontsize=8, ha='right', va='center', color='#888')
+
+    # equator (φ = 0) is a straight line y=0
+    xs, ys = _mollweide_forward(np.linspace(-np.pi, np.pi, 361), np.zeros(361))
+    ax.plot(xs, ys, color=equator_color, lw=1.2, alpha=0.9, label='equator (apical)')
+
+    # prime meridian (λ = 0) is the central vertical curve x=0
+    xs0, ys0 = _mollweide_forward(np.zeros(241), np.linspace(-np.pi/2, np.pi/2, 241))
+    ax.plot(xs0, ys0, color=meridian_color, lw=1.2, alpha=0.9, label='0° meridian (a1)')
+
+    # plot points
+    if x_can.size:
+        ax.plot(x_can, y_can, **can_style)
+    if x_sin.size:
+        ax.plot(x_sin, y_sin, **sin_style)
+
+    # annotate poles (map to x=0, y=±√2)
+    ax.plot([0], [ R_y], **pole_style)
+    ax.plot([0], [-R_y], **pole_style)
+
+    # cosmetics
+    ax.set_xlim(-R_x * 1.02, R_x * 1.02)
+    ax.set_ylim(-R_y * 1.02, R_y * 1.02)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.legend(loc='upper right', frameon=False)
+    ax.grid(False)
+
+    return fig, ax
