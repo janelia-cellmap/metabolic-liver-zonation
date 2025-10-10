@@ -25,7 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal, Dict
 import numpy as np
-from vis import plot_cloud_and_axes_plotly
 
 @dataclass(frozen=True)
 class NematicResult:
@@ -201,28 +200,28 @@ def nematic_from_contact_voxels(
 
 def extract_axes_sigmas(result: NematicResult) -> Dict[str, np.ndarray]:
     """
-    Convenience: unpack a1, a2, a3, sigma1, sigma2, sigma3 in the paper's naming.
+    Convenience: unpack vec1, vec2, vec3, sigma1, sigma2, sigma3 in the paper's naming.
 
     Paper's convention:
       - eigenvalues sorted such that sigma2 <= sigma3 <= sigma1
-      - a1 is the eigenvector for sigma1 (largest)
-      - a2 is the eigenvector for sigma2 (smallest)
-      - a3 is +/- a1 x a2 (implicitly the middle one; here we return the middle)
-        Note: we also return the computed a3 as the eigenvector of sigma3.
+      - vec1 is the eigenvector for sigma1 (largest)
+      - vec2 is the eigenvector for sigma2 (smallest)
+      - vec3 is +/- vec1 x vec2 (implicitly the middle one; here we return the middle)
+        Note: we also return the computed vec3 as the eigenvector of sigma3.
 
     Returns
     -------
     dict with keys:
-        'a1', 'a2', 'a3', 'sigma1', 'sigma2', 'sigma3'
+        'vec1', 'vec2', 'vec3', 'sigma1', 'sigma2', 'sigma3'
     """
     sigma2, sigma3, sigma1 = result.sigmas.tolist()
-    a2 = result.axes[:, 0]
-    a3 = result.axes[:, 1]
-    a1 = result.axes[:, 2]
+    vec2 = result.axes[:, 0]
+    vec3 = result.axes[:, 1]
+    vec1 = result.axes[:, 2]
     return {
-        "a1": a1,
-        "a2": a2,
-        "a3": a3,
+        "vec1": vec1,
+        "vec2": vec2,
+        "vec3": vec3,
         "sigma1": sigma1,
         "sigma2": sigma2,
         "sigma3": sigma3,
@@ -250,61 +249,75 @@ def calculate_and_extract_nematic_results(
     -------
     dict with keys:
         'N' : (3,3) nematic tensor
-        'a1', 'a2', 'a3' : (3,) eigenvectors (axes)
+        'vec1', 'vec2', 'vec3' : (3,) eigenvectors (axes)
         'sigma1', 'sigma2', 'sigma3' : eigenvalues
         'n_valid' : int, number of valid contact voxels used
     """
-    result = nematic_from_contact_voxels(X_contacts, center, eps=eps)
-    axes_sigmas = extract_axes_sigmas(result)
-    return {
-        "N": result.N,
-        **axes_sigmas,
-        "n_valid": result.n_valid
-    }
+    try:
+        result = nematic_from_contact_voxels(X_contacts, center, eps=eps)
+        axes_sigmas = extract_axes_sigmas(result)
+        return {
+            "N": result.N,
+            **axes_sigmas,
+            "n_valid": result.n_valid
+        }
+    except ValueError as e:
+        if str(e) == "No valid contact voxels after radius filtering.":
+            # Return NaNs if no valid voxels
+            return {
+                "N": np.full((3, 3), np.nan),
+                "vec1": np.full(3, np.nan),
+                "vec2": np.full(3, np.nan),
+                "vec3": np.full(3, np.nan),
+                "sigma1": np.nan,
+                "sigma2": np.nan,
+                "sigma3": np.nan,
+                "n_valid": 0
+            }
 
 
-# -------------------------
-# Minimal usage example
-# -------------------------
-if __name__ == "__main__":
-    # Example with a spherical cap: points on z >= z0 on the unit sphere
-    rng = np.random.default_rng(42)
-    n_pts = 5000
-    z0 = 0.3  # cap threshold; larger z0 => smaller cap => stronger anisotropy
+# # -------------------------
+# # Minimal usage example
+# # -------------------------
+# if __name__ == "__main__":
+#     # Example with a spherical cap: points on z >= z0 on the unit sphere
+#     rng = np.random.default_rng(42)
+#     n_pts = 5000
+#     z0 = 0.3  # cap threshold; larger z0 => smaller cap => stronger anisotropy
 
-    # Sample directions uniformly on sphere via normal distribution
-    X = rng.normal(size=(n_pts, 3))
-    X /= np.linalg.norm(X, axis=1, keepdims=True)
+#     # Sample directions uniformly on sphere via normal distribution
+#     X = rng.normal(size=(n_pts, 3))
+#     X /= np.linalg.norm(X, axis=1, keepdims=True)
 
-    # Keep a spherical cap (proxy for an "apical patch")
-    cap = (X[:, 0] <=-.5) | (X[:, 0] >= 0.5)
-    X_cap = X[cap]
+#     # Keep a spherical cap (proxy for an "apical patch")
+#     cap = (X[:, 0] <=-.5) | (X[:, 0] >= 0.5)
+#     X_cap = X[cap]
 
-    # Place the cell center at origin (geometric center)
-    c = np.array([0.0, 0.0, 0.0])
+#     # Place the cell center at origin (geometric center)
+#     c = np.array([0.0, 0.0, 0.0])
 
-    # Treat the contact voxels as sitting on the surface (unit radius)
-    # For voxel data, you would pass actual voxel coordinates in physical units.
-    res = nematic_from_contact_voxels(X_cap, c)
-    unpacked = extract_axes_sigmas(res)
+#     # Treat the contact voxels as sitting on the surface (unit radius)
+#     # For voxel data, you would pass actual voxel coordinates in physical units.
+#     res = nematic_from_contact_voxels(X_cap, c)
+#     unpacked = extract_axes_sigmas(res)
 
-    print("Nematic tensor N:\n", res.N)
-    print("eigenvalues (sigma2 <= sigma3 <= sigma1): ", res.sigmas)
-    print("a1 (director): ", unpacked["a1"])
-    print("a2: ", unpacked["a2"])
-    print("a3: ", unpacked["a3"])
-    print("# valid samples: ", res.n_valid)
+#     print("Nematic tensor N:\n", res.N)
+#     print("eigenvalues (sigma2 <= sigma3 <= sigma1): ", res.sigmas)
+#     print("a1 (director): ", unpacked["a1"])
+#     print("a2: ", unpacked["a2"])
+#     print("a3: ", unpacked["a3"])
+#     print("# valid samples: ", res.n_valid)
 
-    sigma2, sigma3, sigma1 = res.sigmas  # per your printout ordering
-    plot_cloud_and_axes_plotly(
-        X,
-        cap_mask=cap,
-        a1=unpacked["a1"],
-        a2=unpacked["a2"],
-        sigma1=sigma1,     # cylinder length for a1
-        sigma2=sigma2,     # cylinder length for a2
-        c=c,
-        radius=0.03,       # tweak thickness to taste
-        show_sphere=True
-    )
-# %%
+#     sigma2, sigma3, sigma1 = res.sigmas  # per your printout ordering
+#     plot_cloud_and_axes_plotly(
+#         X,
+#         cap_mask=cap,
+#         a1=unpacked["a1"],
+#         a2=unpacked["a2"],
+#         sigma1=sigma1,     # cylinder length for a1
+#         sigma2=sigma2,     # cylinder length for a2
+#         c=c,
+#         radius=0.03,       # tweak thickness to taste
+#         show_sphere=True
+#     )
+# # %%
