@@ -1,3 +1,174 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple, Optional, Literal, Dict
+import numpy as np
+
+"""Nematic smoothing helper functions extracted from vis.py.
+
+This module provides small utilities used for local nematic smoothing of
+unit vectors: unit normalization, Gaussian neighbor weighting, building
+the nematic (structure) tensor and extracting its principal axis.
+
+The functions keep the same internal names used by the callers in
+`vis.py` so the change is minimal (we import these names there).
+"""
+from typing import Tuple
+import numpy as np
+from numpy.linalg import eig
+
+
+def _unit(v, eps: float = 1e-12) -> np.ndarray:
+    """Row-wise normalize vector array `v`.
+
+    v may be shape (M,3) or (3,), this returns the normalized vectors with
+    the same trailing shape. Small norms are stabilized by `eps`.
+    """
+    v = np.asarray(v, float)
+    # handle both (M,3) and (3,) shapes
+    if v.ndim == 1:
+        n = np.linalg.norm(v)
+        return v / max(n, eps)
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    return v / np.maximum(n, eps)
+
+
+def _gaussian_weights(d2: np.ndarray, sigma: float) -> np.ndarray:
+    """Return Gaussian weights for squared distances `d2` and std `sigma`.
+
+    d2 can be a 1-D array of squared distances for a single center to many
+    neighbors. The function returns exp(-0.5 * d2 / sigma**2).
+    """
+    sigma = float(sigma)
+    return np.exp(-0.5 * d2 / (sigma ** 2))
+
+
+def _nematic_weighted(vecs_unit: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Compute the weighted nematic (3x3) tensor from unit vectors.
+
+    Parameters
+    ----------
+    vecs_unit : (M,3) array
+        Unit direction vectors for the neighbor points.
+    weights : (M,) array
+        Non-negative weights for each neighbor.
+
+    Returns
+    -------
+    N : (3,3) array
+        Nematic tensor N = 1.5*(<a a^T>_w - I/3).
+    """
+    I = np.eye(3)
+    aa = np.einsum("mi,mj->mij", vecs_unit, vecs_unit)  # (M,3,3)
+    wsum = np.sum(weights) + 1e-12
+    mean_aa = (weights[:, None, None] * aa).sum(axis=0) / wsum
+    N = 1.5 * (mean_aa - I / 3.0)
+    return N
+
+
+def _principal_axis(N: np.ndarray) -> np.ndarray:
+    """Return the principal eigenvector (unit) of a symmetric 3x3 tensor N."""
+    vals, vecs = eig(N)
+    v = vecs[:, int(np.argmax(vals.real))].real
+    # ensure unit length
+    return _unit(v.ravel())
+
+def locally_average_nematic_vectors(
+    V: np.ndarray,
+    d2: np.ndarray,
+    smoothing_std_um: float
+) -> np.ndarray:
+    """Smooth a field of unit vectors V using local nematic averaging."""
+    V_s = np.zeros_like(V)
+    for i in range(len(V)):
+        w = _gaussian_weights(d2[i], smoothing_std_um)
+        N = _nematic_weighted(V, w)
+        V_s[i] = _principal_axis(N)
+    return V_s
+
+__all__ = ["_unit", "_gaussian_weights", "_nematic_weighted", "_principal_axis", "locally_average_nematic_vectors"]
+
+
+def locally_average_nematic_vectors_from_dataframe(
+    df,
+    base: str,
+    smoothing_std_um: float,
+    sigma_column: str = None,
+    com_units: str = "nm",
+):
+    """Convenience wrapper: compute locally-averaged nematic vectors from a DataFrame.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing COM and base vector columns.
+    base : str
+        Base name used to find columns like '<base> X', '<base> Y', '<base> Z'.
+    smoothing_std_um : float
+        Smoothing standard deviation in µm. If None or <=0, returns normalized vectors.
+    sigma_column : str, optional
+        Optional per-row sigma column that must be finite to count as valid.
+    com_units : str
+        Units string for COM columns (default 'nm'). Returned COMs are converted to µm.
+
+    Returns
+    -------
+    dict with keys:
+      'valid_mask' : (N,) bool array of which rows were valid
+      'V' : (N,3) array of smoothed unit vectors with NaNs for invalid rows
+      'COM_um' : (N,3) array of COM coordinates in µm
+    """
+    import pandas as _pd
+
+    if not isinstance(df, _pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame")
+    # We simplify assumptions: COM columns are exactly 'COM X (nm)', 'COM Y (nm)', 'COM Z (nm)'
+    com_x, com_y, com_z = "COM X (nm)", "COM Y (nm)", "COM Z (nm)"
+    if not all(c in df.columns for c in (com_x, com_y, com_z)):
+        raise KeyError("Required COM columns not found: 'COM X (nm)', 'COM Y (nm)', 'COM Z (nm)'")
+    # find base columns
+    def _pick(col_suffix: str):
+        target = f"{base} {col_suffix}"
+        for c in df.columns:
+            if c == target:
+                return c
+        target_low = target.lower()
+        for c in df.columns:
+            if c.lower() == target_low:
+                return c
+        raise KeyError(f"Missing column '{target}' in DataFrame")
+
+    cx, cy, cz = _pick("X"), _pick("Y"), _pick("Z")
+
+    # COM values are provided in nanometers; convert to micrometers for smoothing
+    COM = df[[com_z, com_y, com_x]].to_numpy(float)
+    COM_um = COM * 1e-3
+
+    V_all = df[[cz, cy, cx]].to_numpy(float)
+    valid = np.all(np.isfinite(V_all), axis=1)
+    if sigma_column is not None:
+        if sigma_column not in df.columns:
+            raise KeyError(f"Specified sigma_column '{sigma_column}' not found in DataFrame.")
+        valid &= np.isfinite(df[sigma_column].to_numpy(float))
+
+    V_out = np.full_like(V_all, np.nan, dtype=float)
+
+    if smoothing_std_um is None or smoothing_std_um <= 0:
+        V_out[valid] = _unit(V_all[valid])
+        return {"valid_mask": valid, "V": V_out, "COM_um": COM_um}
+
+    Pv = COM_um[valid]
+    if Pv.shape[0] == 0:
+        return {"valid_mask": valid, "V": V_out, "COM_um": COM_um}
+
+    d2_full = np.sum((Pv[:, None, :] - Pv[None, :, :]) ** 2, axis=-1)
+    V = _unit(V_all[valid])
+    V_s = locally_average_nematic_vectors(V, d2_full, smoothing_std_um)
+    V_out[valid] = V_s
+
+    return {"valid_mask": valid, "V": V_out, "COM_um": COM_um}
+
+__all__.append("locally_average_nematic_vectors_from_dataframe")
 # %%
 # nematic_voxel.py
 # -------------------------------------------
@@ -19,12 +190,6 @@
 #
 # Author: ChatGPT (protocolized for reproducibility)
 # -------------------------------------------
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Tuple, Optional, Literal, Dict
-import numpy as np
 
 @dataclass(frozen=True)
 class NematicResult:

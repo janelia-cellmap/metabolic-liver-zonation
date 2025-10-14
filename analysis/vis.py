@@ -3,6 +3,14 @@ import matplotlib.pyplot as plt
 from scipy.stats import circmean, circstd
 import os
 import pandas as pd
+from nematic_voxel import (
+    _gaussian_weights,
+    _principal_axis,
+    _nematic_weighted,
+    _unit,
+    locally_average_nematic_vectors,
+    locally_average_nematic_vectors_from_dataframe,
+)
 
 def plot_vector_field_2d(
     polarity_csv_path: str,
@@ -547,7 +555,6 @@ def plot_projected_points_with_two_vectors(
 
 
 # %%
-# Plotting from the paper:
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -600,34 +607,18 @@ def _convert_units(arr, from_units: str):
     if fu in ("mm","millimeter","millimeters"): return arr.astype(float)*1e3, 1e3
     return arr.astype(float), 1.0  # assume already µm
 
-def _gaussian_weights(d2, sigma):
-    return np.exp(-0.5 * d2 / (sigma**2))
-
-def _principal_axis(N):
-    vals, vecs = eig(N)
-    v = vecs[:, np.argmax(vals.real)].real
-    return _unit(v.ravel())
-
-def _nematic_weighted(vecs_unit, weights):
-    """
-    vecs_unit: (M,3) valid unit vectors for neighbors
-    weights: (M,) weights
-    returns Nx3x3 nematic (here single 3x3)
-    """
-    I = np.eye(3)
-    # <aa^T>_w
-    aa = np.einsum("mi,mj->mij", vecs_unit, vecs_unit)  # (M,3,3)
-    wsum = weights.sum() + 1e-12
-    mean_aa = (weights[:, None, None] * aa).sum(axis=0) / wsum
-    N = 1.5 * (mean_aa - I/3.0)
-    return N
-
 # ----------------- main function -----------------
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 def plot_projected_axes_from_csv(
     csv_path: str,
     bases: list,                     # e.g., ["Canaliculi a1"] or multiple
-    plane: str = "XZ",               # "XY" | "XZ" | "YZ"
+    plane: str = "XZ",               # "XY" | "XZ" | "YZ" (used for 2D projection AND 3D camera)
     length_3d: float = 1.0,          # half-length in 3D BEFORE projection (same units as COM)
     com_units: str = "nm",
     smoothing_std_um: float = None,  # e.g., 20.0 for local averaging in µm
@@ -636,29 +627,107 @@ def plot_projected_axes_from_csv(
     figsize=(7,6),
     com_size=10,
     com_alpha=0.8,
+
+    # --- 3D options ---
+    three_d: bool = True,            # default True: interactive 3D (no projection)
+    show_invalid_in_3d: bool = True, # show invalid COMs (red) in 3D mode
+    view_plane: str = None,          # if None, uses `plane`; else "XY"|"XZ"|"YZ"
+    mesh_path: str = None,           # directory containing 1.ply and/or 2.ply
+    mesh1_color: str = "rgba(31,119,180,0.45)",
+    mesh2_color: str = "rgba(255,127,14,0.45)",
+    mesh_opacity: float = None,      # if None, derive from rgba; else override
+    horizontal: bool = True,         # NEW: rotate so Z runs along the Plotly X-axis
+    fig_width: int = 1200,           # bigger canvas
+    fig_height: int = 900
 ):
     """
-    - COM points are plotted: blue if row is valid (finite vector components for ALL requested bases,
-      and finite sigma_column if provided), red otherwise.
-    - For each requested base, we draw line segments centered at COM in +/- direction using the 3D
-      direction (possibly smoothed), with half-length = length_3d. Then we project endpoints to the plane.
-    - If a row is invalid, no line is drawn for it.
+    Modes
+    -----
+    - 3D (three_d=True, default): draw COMs + per-base symmetric ± line segments in 3D (no projection).
+      If mesh_path is provided, overlay mesh_path/1.ply and mesh_path/2.ply as semi-transparent meshes.
+      If horizontal=True, rotate coordinates so original Z -> Plotly X (scene lies horizontally).
+      Camera is oriented to the requested plane.
+
+    - 2D (three_d=False): original behavior. Segments are built in 3D, then projected to the chosen plane.
+
+    Validity
+    --------
+    A row is "valid" if all requested base components are finite and (if provided) sigma_column is finite.
+
+    Returns
+    -------
+    - If three_d=False: (matplotlib_figure, matplotlib_axes)
+    - If three_d=True:  plotly_figure
     """
 
+    # ---------- dependency: your helpers (expected to exist) ----------
+    # _plane_indices(plane) -> (px, py)
+    # _get_com_columns(df) -> (col_x, col_y, col_z)
+    # _convert_units(COM, com_units) -> (COM_um, factor)
+    # _columns_for_base(df, base) -> (cx, cy, cz)
+    # _unit(V) -> row-wise normalized vectors
+    # _gaussian_weights(d2_row, sigma_um) -> weights
+    # _nematic_weighted(V, w) -> 3x3 structure tensor
+    # _principal_axis(N) -> principal unit vector from tensor
+
+    # ---------- small internals ----------
+    import re
+    def _camera_for_plane(p):
+        p = (p or "XZ").upper()
+        if p == "XY":   # look along +Z
+            return dict(eye=dict(x=0, y=0, z=2.8), up=dict(x=0, y=1, z=0))
+        if p == "XZ":   # look along +Y
+            return dict(eye=dict(x=0, y=2.8, z=0.0001), up=dict(x=0, y=0, z=1))
+        if p == "YZ":   # look along +X
+            return dict(eye=dict(x=2.8, y=0, z=0.0001), up=dict(x=0, y=0, z=1))
+        return dict(eye=dict(x=1.9, y=1.9, z=1.9), up=dict(x=0, y=0, z=1))
+
+    def _parse_rgba(rgba_str, default_opacity=0.35):
+        if isinstance(rgba_str, str) and rgba_str.lower().startswith("rgba"):
+            m = re.findall(r"[\d.]+", rgba_str)
+            if len(m) == 4:
+                r, g, b, a = map(float, m)
+                return f"rgb({int(r)},{int(g)},{int(b)})", float(a)
+        return rgba_str, float(default_opacity)
+
+    def _load_mesh_trace(path, name, color_rgba, opacity_override=None):
+        """Return a Plotly Mesh3d trace or None. Requires trimesh if available."""
+        try:
+            import trimesh
+            m = trimesh.load(path, force='mesh')
+            V = np.asarray(m.vertices)
+            F = np.asarray(m.faces)
+            if V.size == 0 or F.size == 0:
+                return None
+            rgb, alpha = _parse_rgba(color_rgba)
+            op = alpha if opacity_override is None else float(opacity_override)
+            return go.Mesh3d(
+                x=V[:,0], y=V[:,1], z=V[:,2],
+                i=F[:,0], j=F[:,1], k=F[:,2],
+                color=rgb, opacity=op, flatshading=True, name=name
+            )
+        except Exception:
+            return None
+
+    def _swap_for_horizontal(x, y, z):
+        """Map original (X,Y,Z) -> (Xh, Yh, Zh) so Z runs horizontally along Plotly X."""
+        # Choose (Xh, Yh, Zh) = (Z, Y, -X) for right-handed feel with 'up' = +Z.
+        return z, y, -x
+
+    # ---------- load + prep ----------
     df = pd.read_csv(csv_path)
-    px, py = _plane_indices(plane)
+    px, py = _plane_indices(plane if plane is not None else "XZ")
     axis_labels = ["X","Y","Z"]
 
     # COMs
     com_x, com_y, com_z = _get_com_columns(df)
-    COM = df[[com_x, com_y, com_z]].to_numpy(float)
+    COM = df[[com_x, com_y, com_z]].to_numpy(float)  # (N,3)
     COM_plot2D = COM[:, [px, py]]
 
     # COM in µm (for smoothing geometry)
     COM_um, _ = _convert_units(COM, com_units)
 
-    # validity mask per row:
-    # - vector components for each requested base must be finite
+    # validity
     valid = np.ones(len(df), dtype=bool)
     base_cols = {}
     for base in bases:
@@ -672,8 +741,119 @@ def plot_projected_axes_from_csv(
             raise KeyError(f"Specified sigma_column '{sigma_column}' not found in CSV.")
         valid &= np.isfinite(df[sigma_column].to_numpy(float))
 
-    # scatter COMs: blue=valid, red=invalid
+    # smoothing distances (among valid only)
+    if smoothing_std_um is not None and smoothing_std_um > 0:
+        Pv = COM_um[valid]  # (Nv,3)
+        d2_full = np.sum((Pv[:, None, :] - Pv[None, :, :])**2, axis=-1)  # (Nv,Nv)
+    else:
+        d2_full = None
+
+    # colors
+    if colors_for_bases is None:
+        default_colors = ["tab:orange", "tab:green", "tab:purple", "tab:brown", "tab:pink"]
+        colors_for_bases = {b: default_colors[i % len(default_colors)] for i, b in enumerate(bases)}
+
+    # =====================================================================
+    # 3D MODE (interactive Plotly): no projection; draw symmetric ± lines
+    # =====================================================================
+    if three_d:
+        traces = []
+
+        # COMs
+        if np.any(~valid) and show_invalid_in_3d:
+            x, y, z = COM[~valid,0], COM[~valid,1], COM[~valid,2]
+            if horizontal:
+                x, y, z = _swap_for_horizontal(x, y, z)
+            traces.append(go.Scatter3d(
+                x=x, y=y, z=z, mode="markers",
+                marker=dict(size=max(2, com_size//2), color="red", opacity=com_alpha),
+                name="COM (invalid)"
+            ))
+        if np.any(valid):
+            x, y, z = COM[valid,0], COM[valid,1], COM[valid,2]
+            if horizontal:
+                x, y, z = _swap_for_horizontal(x, y, z)
+            traces.append(go.Scatter3d(
+                x=x, y=y, z=z, mode="markers",
+                marker=dict(size=max(2, com_size//2), color="blue", opacity=com_alpha),
+                name="COM (valid)"
+            ))
+
+        # For each base: smooth (optional), then draw ± segments: C ± length_3d * v̂
+        for base in bases:
+            cx, cy, cz = base_cols[base]
+            V_all = df[[cx, cy, cz]].to_numpy(float)
+            V = V_all[valid]
+            V = _unit(V)  # (Nv,3)
+            C = COM[valid]
+
+            if d2_full is not None:
+                V = locally_average_nematic_vectors(V, d2_full, smoothing_std_um)
+
+
+            P_minus_3D = C - length_3d * V
+            P_plus_3D  = C + length_3d * V
+
+            # Build a single segment trace with NaN breaks (fast)
+            xs, ys, zs = [], [], []
+            for p0, p1 in zip(P_minus_3D, P_plus_3D):
+                xs += [p0[0], p1[0], np.nan]
+                ys += [p0[1], p1[1], np.nan]
+                zs += [p0[2], p1[2], np.nan]
+
+            if horizontal:
+                xs, ys, zs = _swap_for_horizontal(np.array(xs), np.array(ys), np.array(zs))
+
+            traces.append(go.Scatter3d(
+                x=xs, y=ys, z=zs, mode="lines",
+                line=dict(width=3, color=colors_for_bases[base]),
+                name=base
+            ))
+
+        # Optional mesh overlays
+        if mesh_path:
+            p1 = os.path.join(mesh_path, "1.ply")
+            p2 = os.path.join(mesh_path, "2.ply")
+            for pth, nm, col in [(p1, "mesh 1", mesh1_color), (p2, "mesh 2", mesh2_color)]:
+                if os.path.isfile(pth):
+                    t = _load_mesh_trace(pth, nm, col, mesh_opacity)
+                    if t:
+                        if horizontal:
+                            # rotate vertices by swapping coordinates
+                            Xh, Yh, Zh = _swap_for_horizontal(np.array(t.x), np.array(t.y), np.array(t.z))
+                            t.x, t.y, t.z = Xh, Yh, Zh
+                        traces.append(t)
+
+        # Camera + labels
+        cam = _camera_for_plane(view_plane if view_plane else plane)
+        if horizontal:
+            x_title, y_title, z_title = f"Z (→ X)", "Y", "−X (→ Z)"
+        else:
+            x_title, y_title, z_title = "X", "Y", "Z"
+
+        layout = go.Layout(
+            title=f"3D axes from {os.path.basename(csv_path)} (segments ±{length_3d:.1f} {com_units})",
+            scene=dict(
+                xaxis=dict(title=x_title, showspikes=False),
+                yaxis=dict(title=y_title, showspikes=False),
+                zaxis=dict(title=z_title, showspikes=False),
+                aspectmode="data",
+                camera=cam,
+            ),
+            margin=dict(l=10, r=10, b=10, t=60),  # tighter margins to fill space
+            legend=dict(x=1.02, y=1.0)
+        )
+        fig = go.Figure(data=traces, layout=layout)
+        fig.update_layout(width=fig_width, height=fig_height)
+        fig.show()
+        return fig
+
+    # =====================================================================
+    # 2D MODE (Matplotlib): original behavior (no rotation needed)
+    # =====================================================================
     fig, ax = plt.subplots(figsize=figsize)
+
+    # scatter COMs: blue=valid, red=invalid
     ax.scatter(
         COM_plot2D[~valid, 0], COM_plot2D[~valid, 1],
         c="red", s=com_size, alpha=com_alpha, label="COM (invalid)"
@@ -683,54 +863,32 @@ def plot_projected_axes_from_csv(
         c="blue", s=com_size, alpha=com_alpha, label="COM (valid)"
     )
 
-    # Precompute kd-ish full pairwise d2 if smoothing requested (only among valid rows)
-    if smoothing_std_um is not None and smoothing_std_um > 0:
-        Pv = COM_um[valid]                      # (Nv,3)
-        d2_full = np.sum((Pv[:, None, :] - Pv[None, :, :])**2, axis=-1)  # (Nv,Nv)
-
-    # per-base plotting
-    if colors_for_bases is None:
-        # cycle basic colors; you can override
-        default_colors = ["tab:orange", "tab:green", "tab:purple", "tab:brown", "tab:pink"]
-        colors_for_bases = {b: default_colors[i % len(default_colors)] for i, b in enumerate(bases)}
-
+    # per-base plotting (same math; then project)
     for base in bases:
         cx, cy, cz = base_cols[base]
-        V = df[[cx, cy, cz]].to_numpy(float)         # (N,3)
-        V = V[valid]                                  # only valid rows
-        V = _unit(V)                                  # unit 3D directions
-        C = COM[valid]                                # (Nv,3)
+        V_all = df[[cx, cy, cz]].to_numpy(float)
+        V = V_all[valid]
+        V = _unit(V)
+        C = COM[valid]
 
-        # smoothing (on valid rows only)
-        if smoothing_std_um is not None and smoothing_std_um > 0:
-            # recompute V at each valid row via nematic-weighted average of all valid rows
-            V_s = np.zeros_like(V)
-            for i in range(len(V)):
-                w = _gaussian_weights(d2_full[i], smoothing_std_um)
-                N = _nematic_weighted(V, w)
-                V_s[i] = _principal_axis(N)
-            V = V_s
+        if d2_full is not None:
+            V = locally_average_nematic_vectors(V, d2_full, smoothing_std_um)
 
-        # For each valid row: build 3D endpoints before projection
-        # endpoints_3D = C +/- length_3d * V
-        P_minus_3D = C - length_3d * V
-        P_plus_3D  = C + length_3d * V
-
-        # project endpoints to the chosen 2D plane
-        Pm2 = P_minus_3D[:, [px, py]]
-        Pp2 = P_plus_3D[:, [px, py]]
+        Pm3 = C - length_3d * V
+        Pp3 = C + length_3d * V
+        Pm2 = Pm3[:, [px, py]]
+        Pp2 = Pp3[:, [px, py]]
 
         color = colors_for_bases[base]
-        # draw segments
         for p0, p1 in zip(Pm2, Pp2):
             ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=color, linewidth=1.8)
 
-        # legend proxy
         if len(Pm2) > 0:
             ax.plot([Pm2[0,0], Pp2[0,0]], [Pm2[0,1], Pp2[0,1]],
                     color=color, linewidth=2.5, label=base)
 
     ax.set_aspect("equal", adjustable="box")
+    axis_labels = ["X","Y","Z"]
     ax.set_xlabel(axis_labels[px] + (f" ({com_units})" if com_units else ""))
     ax.set_ylabel(axis_labels[py] + (f" ({com_units})" if com_units else ""))
     title = f"Projected {bases} on {plane} (segments built in 3D, half-length={length_3d} {com_units})"
@@ -740,6 +898,7 @@ def plot_projected_axes_from_csv(
     ax.legend(loc="best")
     plt.tight_layout()
     plt.show()
+    return fig, ax
 
 #%% Mollweide projection of spherical data
 import numpy as np
