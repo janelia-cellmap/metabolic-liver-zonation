@@ -5,11 +5,10 @@ import numpy as np
 import pandas as pd
 from funlib.geometry import Roi, Coordinate
 from tqdm import tqdm
-from sklearn.neighbors import NearestNeighbors
 import os
 import time
 import yaml
-from nematic_voxel import calculate_and_extract_nematic_results
+from nematic_voxel import calculate_and_extract_nematic_results, locally_average_nematic_vectors_from_dataframe
 from simple_vector_measures import polarity_isotropic
 import numpy as np
 import json 
@@ -172,6 +171,19 @@ if __name__ == "__main__":
         # Convert results to DataFrame
         polarity_df = pd.DataFrame(results)
         
+        for base in ["Canaliculi a1", "Canaliculi a2", "Sinusoids b1", "Sinusoids b2"]:
+            # Smooth nematic vectors and add to dataframe
+            smoothed = locally_average_nematic_vectors_from_dataframe(
+                polarity_df,
+                base=base,
+                sigma_column = f"{base} sigma",
+                smoothing_std_um=20.0,
+            )
+            smoothed = smoothed['V']
+            polarity_df[f"{base} Smoothed Z"] = smoothed[:, 0]
+            polarity_df[f"{base} Smoothed Y"] = smoothed[:, 1]
+            polarity_df[f"{base} Smoothed X"] = smoothed[:, 2]
+            
         # Save to CSV
         os.makedirs(
             f"{analysis_dir}/{dataset}/tmp_secondary_results",
@@ -242,7 +254,7 @@ cell_idi = ImageDataInterface(
 cell_df = pd.read_csv(f"{analysis_dir}/{dataset}/cell_assignments/cell.csv")
 unique_cells = cell_df["Object ID"].to_numpy()
 cell_com, can_pts, sin_pts, results = process_cell(
-    cell_id=1112,
+    cell_id=1131,
     cell_df=cell_df,
     cell_idi=cell_idi,
     canaliculi_contacts_idi=canaliculi_contacts_idi,
@@ -255,8 +267,24 @@ b1 = np.array([results["Sinusoids b1 Z"], results["Sinusoids b1 Y"], results["Si
 b2 = np.array([results["Sinusoids b2 Z"], results["Sinusoids b2 Y"], results["Sinusoids b2 X"]])
 plot_projected_points_with_two_vectors(can_pts, cell_com, vec1=a1, vec2=a2,sigma1=results["Canaliculi a1 sigma"], sigma2=results["Canaliculi a2 sigma"], vector_scale=3, point_size_proj=0.5)
 # %%
-plot_projected_points_with_two_vectors(sin_pts, cell_com, vec1=b1, vec2=b2,sigma1=results["Sinusoids b1 sigma"], sigma2=results["Sinusoids b2 sigma"], vector_scale=3, point_size_proj=0.5)
+# plot_projected_points_with_two_vectors(sin_pts, cell_com, vec1=b1, vec2=b2,sigma1=results["Sinusoids b1 sigma"], sigma2=results["Sinusoids b2 sigma"], vector_scale=3, point_size_proj=0.5)
 
 # %%
 plot_mollweide_polarity(a1, b1, cell_com, can_pts=can_pts)
+# %%
+from vis import plot_projected_axes_from_csv
+for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
+    for smoothing_std in [None, 20]:
+        polarity_csv = f"{analysis_dir}/{dataset}/tmp_secondary_results/cell_polarity_vectors.csv"
+        base = "Canaliculi a1"
+        plot_projected_axes_from_csv(csv_path=polarity_csv, bases=[base], plane="YZ", length_3d=5000.0, smoothing_std_um=smoothing_std, colors_for_bases={base:"green"}, com_alpha=0.0, mesh_path="/nrs/cellmap/ackermand/meshes/multiresolution/jrc_mus-liver-zon-1/veins/mesh_lods/s5")
+
+# %%
+from vis import plot_projected_axes_from_csv
+for dataset in ["jrc_mus-liver-zon-1", "jrc_mus-liver-zon-2"]:
+    smoothing_std = None
+    polarity_csv = f"{analysis_dir}/{dataset}/tmp_secondary_results/cell_polarity_vectors.csv"
+    base = "Canaliculi a1 Smoothed"
+    plot_projected_axes_from_csv(csv_path=polarity_csv, bases=[base], plane="YZ", length_3d=5000.0, smoothing_std_um=smoothing_std, colors_for_bases={base:"green"}, com_alpha=0.0, mesh_path="/nrs/cellmap/ackermand/meshes/multiresolution/jrc_mus-liver-zon-1/veins/mesh_lods/s5")
+
 # %%
